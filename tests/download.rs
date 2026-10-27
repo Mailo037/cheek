@@ -181,6 +181,30 @@ async fn resumes_from_the_sidecar() {
     assert_eq!(requests, 1 + count - count / 2, "only the missing chunks plus the probe");
 }
 
+#[tokio::test]
+async fn resumes_with_a_different_connection_count() {
+    let data = body(6 * 1024 * 1024);
+    let (url, hits) = serve(data.clone(), true, 0).await;
+    let dir = tempdir();
+    let dest = dir.join("e.mp4");
+    // Notes from a run with other chunking than one connection would pick now.
+    let chunk = 512u64 << 10;
+    let count = (data.len() as u64).div_ceil(chunk) as usize;
+    let kept = count * 3 / 4;
+    let mut partial = data[..chunk as usize * kept].to_vec();
+    partial.resize(data.len(), 0);
+    std::fs::write(&dest, partial).unwrap();
+    let done: Vec<bool> = (0..count).map(|i| i < kept).collect();
+    std::fs::write(
+        dir.join("e.mp4.cheek"),
+        serde_json::json!({"total": data.len(), "chunk": chunk, "done": done}).to_string(),
+    )
+    .unwrap();
+    fetch(&shared(1), &stream(url), &dest).await.unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), *data);
+    assert_eq!(hits.load(Ordering::SeqCst), 1 + count - kept, "the notes' chunks, not new ones");
+}
+
 fn tempdir() -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("cheek-test-{}-{}", std::process::id(), rand_suffix()));
     std::fs::create_dir_all(&d).unwrap();

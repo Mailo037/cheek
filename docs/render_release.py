@@ -1,5 +1,6 @@
-"""Renders docs/releases/v0.2.0.png, the picture on top of the 0.2.0 release notes, in
-the same look as docs/hero.png.
+"""Renders docs/releases/v<VERSION>.png, the picture on top of a release's notes, in the
+same look as docs/hero.png. Change VERSION, the headline, FEATURES and the terminal lines
+for each release; older pictures stay in docs/releases.
 
     python docs/render_release.py --fonts ../Hamstr/app/src/main/res/font
 """
@@ -11,12 +12,12 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 CANVAS, OVERLAY, LINE = (20, 20, 20), (30, 30, 30), (54, 54, 54)
 INK, MUTED, GHOST, ACCENT, GREEN = (238, 238, 238), (170, 170, 170), (138, 138, 138), (255, 154, 60), (16, 185, 129)
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 FEATURES = [
-    ("COVERS + TAGS", "--embed-thumbnail, --embed-metadata"),
-    ("FRAGMENT RESUME", "HLS and DASH continue where they stopped"),
-    ("PICK FROM JSON", "-f works on --info-json, no second yt-dlp run"),
+    ("RESUME KEEPS ITS PLACE", "Finished chunks count after a new -N too"),
+    ("NO SECOND START", "Fewer or more connections, same file"),
 ]
+HEADLINE = ("Pause with 12 connections,", "pick up with 4.")
 
 
 def main():
@@ -49,8 +50,8 @@ def main():
     d = ImageDraw.Draw(img)
     d.text((112, 150), "cheek", font=f("jetbrains_mono_600.ttf", 150), fill=INK)
     d.text((120, 345), f"[ v{VERSION} ]", font=f("jetbrains_mono_600.ttf", 44), fill=ACCENT)
-    d.text((118, 440), "Covers in every file,", font=f("inter_500.ttf", 54), fill=INK)
-    d.text((118, 510), "downloads that pick up again.", font=f("inter_500.ttf", 54), fill=INK)
+    d.text((118, 440), HEADLINE[0], font=f("inter_500.ttf", 54), fill=INK)
+    d.text((118, 510), HEADLINE[1], font=f("inter_500.ttf", 54), fill=INK)
     y = 650
     for title, sub in FEATURES:
         d.text((118, y), "*", font=f("jetbrains_mono_600.ttf", 30), fill=ACCENT)
@@ -69,17 +70,15 @@ def main():
     tf = f("jetbrains_mono_400.ttf", 27)
     tb = f("jetbrains_mono_600.ttf", 27)
     lines = [
-        [("$ ", GHOST), ("yt-dlp -J URL > info.json", INK)],
-        [("$ ", GHOST), ("cheek ", ACCENT), ("--info-json info.json \\", INK)],
-        [("    -f ", INK), ('"bv*[height<=720]+ba"', ACCENT), (" --embed-thumbnail", INK)],
-        [("[Youtube] ", GHOST), ("Caminandes 3: Llamigos  (2 streams)", MUTED)],
-        [("[cheek] ", GHOST), ("720p + opus, picked from the JSON", INK)],
-        [("[cheek] ", GHOST), ("tagging", INK), ("  cover, title, artist", MUTED)],
-        [("        -> ", GHOST), ("Caminandes 3 [SkVqJ1SGeL0].mp4", GREEN)],
+        [("$ ", GHOST), ("cheek ", ACCENT), ("-N 12 https://…/film.mp4", INK)],
+        [("[cheek] ", GHOST), ("12 connections, 1 MiB chunks", MUTED)],
+        [("^C", GHOST)],
+        [("[cheek] ", GHOST), ("stopped at 812 of 1340 MiB", MUTED)],
         [],
-        [("$ ", GHOST), ("cheek ", ACCENT), ("https://…/master.m3u8", INK)],
-        [("[cheek] ", GHOST), ("resuming at fragment 412/980", INK)],
+        [("$ ", GHOST), ("cheek ", ACCENT), ("-N 4 https://…/film.mp4", INK)],
+        [("[cheek] ", GHOST), ("resuming with the saved chunks", INK)],
         "BAR",
+        [("        -> ", GHOST), ("film.mp4", GREEN)],
     ]
     y = py + 100
     for parts in lines:
@@ -87,8 +86,8 @@ def main():
             bx, bw = px + 44, 440
             d.text((bx, y), "*", font=tb, fill=ACCENT)
             d.rounded_rectangle((bx + 40, y + 12, bx + 40 + bw, y + 22), 5, fill=LINE)
-            d.rounded_rectangle((bx + 40, y + 12, bx + 40 + int(bw * 0.42), y + 22), 5, fill=ACCENT)
-            d.text((bx + 40 + bw + 24, y), "412/980  18.1 MiB/s", font=tf, fill=MUTED)
+            d.rounded_rectangle((bx + 40, y + 12, bx + 40 + int(bw * 0.61), y + 22), 5, fill=ACCENT)
+            d.text((bx + 40 + bw + 24, y), "812/1340 MiB  21.4 MiB/s", font=tf, fill=MUTED)
             y += 50
             continue
         x = px + 44

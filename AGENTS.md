@@ -34,8 +34,10 @@ TLS uses rustls with bundled Mozilla roots, so the binary runs as a plain proces
 Bump `version` in `Cargo.toml`, then push a tag:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
+
+Every release gets a what's-new picture on top of its notes. Before tagging, update `VERSION`, the headline, `FEATURES` and the terminal lines in [`docs/render_release.py`](docs/render_release.py), run `python docs/render_release.py --fonts ../Hamstr/app/src/main/res/font`, look at the result and commit `docs/releases/v<version>.png`. The notes link it by the tag (`raw.githubusercontent.com/Mailo037/cheek/v<version>/docs/releases/v<version>.png`), so the picture has to be in the tagged commit. A bugfix release gets one too.
 
 [`release.yml`](.github/workflows/release.yml) builds every binary and publishes them with `SHA256SUMS.txt`. If `.github/release-notes/<tag>.md` exists, it becomes the release text. Hamstr picks up releases with the same command line by itself (same major version, for 0.x the same minor).

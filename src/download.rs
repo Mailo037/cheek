@@ -103,23 +103,27 @@ async fn ranged_fetch(shared: &Shared, stream: &Stream, dest: &Path, total: u64)
     let opts = &shared.options;
     let limit = stream.chunk_limit.unwrap_or(u64::MAX).min(opts.chunk_size).max(1);
     // Enough chunks that every connection stays busy until the end, but none above the limit.
-    let chunk = (total / (opts.connections.clamp(1, 64) as u64 * 4)).clamp(MIN_CHUNK.min(limit), limit);
-    let count = total.div_ceil(chunk) as usize;
+    let mut chunk = (total / (opts.connections.clamp(1, 64) as u64 * 4)).clamp(MIN_CHUNK.min(limit), limit);
 
     let sidecar = state_path(dest);
-    let mut done = vec![false; count];
-    // Resume only when the notes describe exactly this file and chunking.
+    let mut done = None;
+    // Resume when the notes describe this file. Their chunking wins, so a different
+    // connection count (say, more downloads at once) doesn't throw the progress away.
     if dest.exists()
         && let Ok(s) = tokio::fs::read(&sidecar)
             .await
             .map_err(anyhow::Error::from)
             .and_then(|b| Ok(serde_json::from_slice::<State>(&b)?))
         && s.total == total
-        && s.chunk == chunk
-        && s.done.len() == count
+        && s.chunk > 0
+        && s.chunk <= limit
+        && s.done.len() as u64 == total.div_ceil(s.chunk)
     {
-        done = s.done;
+        chunk = s.chunk;
+        done = Some(s.done);
     }
+    let count = total.div_ceil(chunk) as usize;
+    let done = done.unwrap_or_else(|| vec![false; count]);
     let file = OpenOptions::new()
         .create(true)
         .write(true)
