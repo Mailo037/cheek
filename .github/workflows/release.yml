@@ -77,4 +77,4 @@ jobs:
           cd dist && sha256sum * > SHA256SUMS.txt && cd ..
           NOTES=".github/release-notes/$GITHUB_REF_NAME.md"
           if [ -f "$NOTES" ]; then set -- --notes-file "$NOTES"; else set -- --generate-notes; fi
-          gh release create "$GITHUB_REF_NAME" dist/* --title "cheek ${GITHUB_REF_NAME#v}" --verify-tag "$@"
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --verify-tag "$@"

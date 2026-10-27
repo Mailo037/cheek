@@ -35,7 +35,13 @@ impl Target {
             }
             ensure!(matches!(u.scheme(), "http" | "https"), "CineSrc links require HTTP or HTTPS");
             let path = u.path().trim_matches('/');
-            let parts = path.strip_prefix("embed/").unwrap_or(path).split('/').map(str::to_owned).collect();
+            let parts = path
+                .strip_prefix("embed/")
+                .or_else(|| path.strip_prefix("watch/"))
+                .unwrap_or(path)
+                .split('/')
+                .map(str::to_owned)
+                .collect();
             (parts, u.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect())
         };
         let usage = "use cinesrc:movie:TMDB_ID or cinesrc:tv:TMDB_ID:SEASON:EPISODE";
@@ -352,12 +358,14 @@ mod tests {
             "cinesrc:movie:42",
             "cineby:movie:42",
             "https://cineby.rocks/movie/42",
+            "https://cineby.rocks/watch/movie/42",
             "https://cinesrc.st/embed/movie/42",
         ] {
             assert_eq!(Target::parse(input).unwrap().unwrap().embed(), "https://cinesrc.st/embed/movie/42");
         }
         for input in [
             "cinesrc:tv:1396:1:2",
+            "https://cineby.rocks/watch/tv/1396/1/2",
             "https://cineby.rocks/tv/1396?s=1&e=2",
             "https://cinesrc.st/embed/tv/1396?season=1&episode=2",
         ] {

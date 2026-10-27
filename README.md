@@ -94,6 +94,7 @@ links, CineSrc embed links, or a short ID reference:
 cheek cinesrc:movie:TMDB_ID -J
 cheek cinesrc:tv:TMDB_ID:SEASON:EPISODE -J
 cheek "https://cineby.rocks/movie/TMDB_ID"
+cheek "https://cineby.rocks/watch/movie/TMDB_ID"
 cheek "https://cinesrc.st/embed/tv/TMDB_ID?s=1&e=2"
 ```
 
@@ -110,8 +111,10 @@ path if necessary. Your regular browser profile is not used.
 
 Resolution times out after 90 seconds when the player cannot supply a stream.
 Availability depends on CineSrc and its selected server. Encrypted HLS remains
-unsupported. This resolver needs a desktop browser; Android cannot resolve these
-IDs using the standalone binary. `--resolver yt-dlp` explicitly bypasses it.
+unsupported. The standalone resolver needs a desktop browser. On Android, Hamstr
+resolves these IDs through the system WebView and hands Cheek the resulting media
+JSON through `--info-json`; no desktop browser is needed in the app.
+`--resolver yt-dlp` explicitly bypasses the standalone resolver.
 
 ### JSON events
 
