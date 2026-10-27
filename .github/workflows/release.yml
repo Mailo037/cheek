@@ -1,0 +1,82 @@
+name: Release
+
+# Push a tag like v0.2.0: builds cheek for desktop and Android and publishes the binaries.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, name: cheek-x86_64-linux, musl: true }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, name: cheek-aarch64-linux, musl: true }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, name: cheek-x86_64-windows.exe }
+          - { os: macos-latest, target: aarch64-apple-darwin, name: cheek-aarch64-macos }
+          - { os: macos-latest, target: x86_64-apple-darwin, name: cheek-x86_64-macos }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Rename
+        shell: bash
+        run: |
+          mkdir dist
+          src=target/${{ matrix.target }}/release/cheek
+          [ -f "$src.exe" ] && src="$src.exe"
+          cp "$src" "dist/${{ matrix.name }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
+      - run: cargo install cargo-ndk --locked
+      - name: Build
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 --platform 26 build --release --locked
+      - name: Rename
+        run: |
+          mkdir dist
+          cp target/aarch64-linux-android/release/cheek dist/cheek-android-arm64-v8a
+          cp target/armv7-linux-androideabi/release/cheek dist/cheek-android-armeabi-v7a
+          cp target/x86_64-linux-android/release/cheek dist/cheek-android-x86_64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android
+          path: dist/*
+
+  publish:
+    needs: [desktop, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist && sha256sum * > SHA256SUMS.txt && cd ..
+          NOTES=".github/release-notes/$GITHUB_REF_NAME.md"
+          if [ -f "$NOTES" ]; then set -- --notes-file "$NOTES"; else set -- --generate-notes; fi
+          gh release create "$GITHUB_REF_NAME" dist/* --title "cheek ${GITHUB_REF_NAME#v}" --verify-tag "$@"
