@@ -3,8 +3,8 @@
 use crate::download::{self, Options, Shared};
 use crate::events::{Event, Progress, Reporter};
 use crate::hls;
-use crate::media::{Media, Protocol, Stream, StreamKind};
-use crate::merge::{Ffmpeg, audio_ext_for};
+use crate::media::{Media, Protocol, Stream, StreamKind, is_audio_ext};
+use crate::merge::{Ffmpeg, audio_ext_for, taggable};
 use crate::template;
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
@@ -25,6 +25,10 @@ pub struct Job {
     pub max_height: Option<u32>,
     pub ffmpeg: Option<Ffmpeg>,
     pub options: Options,
+    /// Write the thumbnail into the file as its cover (needs ffmpeg).
+    pub embed_thumbnail: bool,
+    /// Write title, artist and link even into files that needed no other ffmpeg step.
+    pub embed_metadata: bool,
 }
 
 pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBuf> {
@@ -93,9 +97,18 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
         options: job.options.clone(),
     };
     let started = Instant::now();
-    {
+    let thumbnail = temp_dir.join(format!("cheek-cover-{}", std::process::id()));
+    let fetch_cover = async {
+        let url = media.thumbnail.as_deref().filter(|_| job.embed_thumbnail && job.ffmpeg.is_some())?;
+        // A missing cover is no reason to fail the download.
+        let get = async { anyhow::Ok(shared.client.get(url).send().await?.error_for_status()?.bytes().await?) };
+        let bytes = tokio::time::timeout(std::time::Duration::from_secs(20), get).await.ok()?.ok()?;
+        tokio::fs::write(&thumbnail, &bytes).await.ok()?;
+        Some(())
+    };
+    let (downloaded, got_cover) = {
         let _watch = reporter.watch(shared.progress.clone());
-        futures_util::future::try_join_all(streams.iter().zip(&parts).map(|(s, p)| {
+        let downloads = futures_util::future::try_join_all(streams.iter().zip(&parts).map(|(s, p)| {
             let shared = &shared;
             async move {
                 match s.protocol {
@@ -105,8 +118,12 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
                 }
                 .with_context(|| format!("downloading {}", s.format_id.as_deref().unwrap_or("the stream")))
             }
-        }))
-        .await?;
+        }));
+        tokio::join!(downloads, fetch_cover)
+    };
+    if let Err(e) = downloaded {
+        tokio::fs::remove_file(&thumbnail).await.ok();
+        return Err(e);
     }
     let (done, _) = shared.progress.snapshot();
     reporter.emit(&Event::Progress {
@@ -132,30 +149,58 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
     // storage it can't seek in, like Android's shared folders).
     // A plain name: ffmpeg reads `%` in output names as an image-sequence pattern.
     let merged = temp_dir.join(format!("cheek-merge-{}.{ext}", std::process::id()));
+    let cover = match (&job.ffmpeg, got_cover) {
+        (Some(ffmpeg), Some(())) => ffmpeg.cover(&thumbnail).await.ok(),
+        _ => None,
+    };
+    let cover = cover.as_ref();
+    // Files that need no other ffmpeg step still get their tags and cover when asked to.
+    let retag = |video: bool| {
+        let ffmpeg = job
+            .ffmpeg
+            .as_ref()
+            .filter(|_| (job.embed_metadata || cover.is_some()) && taggable(&ext));
+        let (files, merged, final_path) = (&files, &merged, &final_path);
+        async move {
+            match ffmpeg {
+                Some(ffmpeg) => {
+                    reporter.emit(&Event::Stage { stage: "tagging" });
+                    ffmpeg.tag(&files[0], merged, media, video, cover).await?;
+                    move_file(merged, final_path).await
+                }
+                None => move_file(&files[0], final_path).await,
+            }
+        }
+    };
     if job.audio.is_some() {
         let source_ext = files[0].extension().and_then(|e| e.to_str()).unwrap_or("");
         if source_ext.eq_ignore_ascii_case(&ext) && streams[0].kind == StreamKind::Audio && streams[0].protocol != Protocol::Hls {
-            move_file(&files[0], &final_path).await?;
+            retag(false).await?;
         } else {
             reporter.emit(&Event::Stage { stage: "extracting audio" });
             need_ffmpeg("extract the audio")?
-                .audio(&files[0], streams[0].codec.as_deref(), &merged, media)
+                .audio(&files[0], streams[0].codec.as_deref(), &merged, media, cover)
                 .await?;
             move_file(&merged, &final_path).await?;
         }
     } else if files.len() > 1 {
         reporter.emit(&Event::Stage { stage: "merging" });
         let hls = streams.iter().any(|s| s.protocol == Protocol::Hls);
-        need_ffmpeg("merge video and audio")?.mux(&files, &merged, media, hls).await?;
+        need_ffmpeg("merge video and audio")?
+            .mux(&files, &merged, media, hls, cover)
+            .await?;
         move_file(&merged, &final_path).await?;
     } else if streams[0].protocol == Protocol::Hls && ext != "ts" {
         reporter.emit(&Event::Stage { stage: "remuxing" });
-        need_ffmpeg("remux the HLS stream")?.mux(&files, &merged, media, true).await?;
+        need_ffmpeg("remux the HLS stream")?
+            .mux(&files, &merged, media, true, cover)
+            .await?;
         move_file(&merged, &final_path).await?;
     } else {
-        move_file(&files[0], &final_path).await?;
+        retag(streams[0].kind != StreamKind::Audio && !is_audio_ext(&ext)).await?;
     }
-    for f in files.iter().chain([&merged]) {
+    let covers = [thumbnail.clone(), thumbnail.with_extension("jpg")];
+    for f in files.iter().chain([&merged]).chain(&covers) {
         if f != &final_path {
             tokio::fs::remove_file(f).await.ok();
         }

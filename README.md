@@ -70,6 +70,8 @@ cheek https://example.com/talk.mp4 -N 8 --chunk-size 1M
 | `--resolver` | `auto` | `auto`: cheek first, yt-dlp for the big sites; `native` or `yt-dlp` to force one |
 | `-x`, `--audio-format` | `best` | Keep only the sound: `best`, `opus`, `m4a`, `mp3`, `flac`, `wav` |
 | `--merge-output-format` | picked like yt-dlp | `mp4`, `mkv` or `webm` when video and audio are joined |
+| `--embed-thumbnail` | | Write the thumbnail into the file as its cover (mp4, m4a, mkv, mp3, opus, ogg, flac) |
+| `--embed-metadata` | | Write title, artist and link into every file, even one that needed no ffmpeg step |
 | `--json` | | One JSON event per line on stdout, for apps |
 | `-J, --dump-json` | | Print what would be downloaded and stop |
 
@@ -77,7 +79,7 @@ Parallel downloading is automatic: direct files use byte ranges when the server 
 
 Static, unencrypted DASH fragment lists support absolute URLs and paths relative to `fragment_base_url`. Live DASH, encrypted fragments and DASH byte-range fragments are rejected. HLS encryption and byte-range playlists remain unsupported.
 
-Press Ctrl+C and the `.part` file stays. Ranged HTTP downloads also keep a small `.cheek` note of completed chunks and resume on the next run. HLS and DASH fragment downloads restart from the beginning.
+Press Ctrl+C and the `.part` file stays. Ranged HTTP downloads keep a small `.cheek` note of completed chunks, and HLS and DASH fragment downloads one of the fragments already written; both resume on the next run, even when a fresh resolve hands out new tokens for the same fragments.
 
 ### JSON events
 
@@ -90,7 +92,7 @@ With `--json`, every line on stdout is one event:
 {"type":"done","path":"Caminandes 3： Llamigos [SkVqJ1SGeL0].mp4","bytes":26214400,"seconds":1.2}
 ```
 
-When something fails, the last line is `{"type":"error","message":"..."}` and the exit code is 1. An interruption exits with 130.
+`stage` is one of `merging`, `extracting audio`, `remuxing`, `tagging` (only tags and cover, no other ffmpeg step) or `already downloaded`; it arrives once the bytes are in and ffmpeg takes over. When something fails, the last line is `{"type":"error","message":"..."}` and the exit code is 1. An interruption exits with 130.
 
 ## Install
 
