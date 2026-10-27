@@ -1,5 +1,6 @@
 //! Turning a link into `Media`.
 
+pub mod cinesrc;
 pub mod generic;
 pub mod ytdlp;
 
@@ -70,6 +71,11 @@ pub fn which(name: &str) -> Option<PathBuf> {
 }
 
 pub async fn resolve(client: &Client, url: &str, opts: &ResolveOptions) -> Result<Media> {
+    if opts.resolver != Resolver::YtDlp
+        && let Some(target) = cinesrc::Target::parse(url)?
+    {
+        return cinesrc::extract(client, &target).await;
+    }
     let yt_dlp = || find_yt_dlp(opts.yt_dlp.as_ref());
     match opts.resolver {
         Resolver::Native => generic::extract(client, url).await,

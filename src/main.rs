@@ -3,7 +3,7 @@ use cheek::download::Options;
 use cheek::events::{Event, Reporter};
 use cheek::extract::{self, ResolveOptions, Resolver};
 use cheek::merge::Ffmpeg;
-use cheek::{Job, Media, http};
+use cheek::{Job, Media, http, select};
 use clap::Parser;
 use std::io::Read;
 use std::path::PathBuf;
@@ -25,9 +25,10 @@ struct Cli {
     #[arg(short = 'J', long)]
     dump_json: bool,
 
-    /// yt-dlp format selector, used when yt-dlp resolves the link.
-    #[arg(short, long, default_value = "bv*+ba/b")]
-    format: String,
+    /// yt-dlp format selector [default: bv*+ba/b]. Passed to yt-dlp when it resolves the
+    /// link; with --info-json cheek picks from the JSON's formats itself.
+    #[arg(short, long)]
+    format: Option<String>,
 
     /// Who resolves the link.
     #[arg(long, value_enum, default_value_t = Resolver::Auto)]
@@ -138,6 +139,8 @@ async fn go(cli: Cli, reporter: &Reporter) -> Result<()> {
             // Either yt-dlp's info dict or cheek's own -J output.
             if value.get("streams").is_some() {
                 serde_json::from_value(value)?
+            } else if let Some(spec) = &cli.format {
+                extract::ytdlp::from_info_json(&select::apply(&value, spec)?)?
             } else {
                 extract::ytdlp::from_info_json(&value)?
             }
@@ -147,7 +150,7 @@ async fn go(cli: Cli, reporter: &Reporter) -> Result<()> {
             let opts = ResolveOptions {
                 resolver: cli.resolver,
                 yt_dlp: cli.yt_dlp.clone(),
-                format: cli.format.clone(),
+                format: cli.format.clone().unwrap_or_else(|| "bv*+ba/b".into()),
             };
             extract::resolve(&client, url, &opts).await?
         }

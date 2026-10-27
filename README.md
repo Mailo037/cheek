@@ -48,6 +48,10 @@ cheek "https://www.youtube.com/watch?v=SkVqJ1SGeL0" -f "bv*[height<=1080]+ba/b"
 # Or hand over yt-dlp's JSON yourself
 yt-dlp -J -f "bv*+ba/b" URL | cheek --info-json -
 
+# Resolve once, then pick a quality from the same JSON without starting yt-dlp again
+yt-dlp -J URL > info.json
+cheek --info-json info.json -f "bv*[height<=720]+ba/b[height<=720]"
+
 # Sound only, without re-encoding when the source is already Opus or AAC
 cheek -x URL
 cheek -x --audio-format mp3 URL
@@ -66,7 +70,7 @@ cheek https://example.com/talk.mp4 -N 8 --chunk-size 1M
 | `-o, --output` | `%(title)s [%(id)s].%(ext)s` | yt-dlp's template syntax (`title`, `id`, `ext`, `extractor`, `uploader`, `.NB` to cut) |
 | `-P, --paths` | `.` | Folder for finished files |
 | `--temp-dir` | output folder | Where `.part` files wait |
-| `-f, --format` | `bv*+ba/b` | yt-dlp format selector, used when yt-dlp resolves |
+| `-f, --format` | `bv*+ba/b` | yt-dlp format selector. Passed to yt-dlp when it resolves; with `--info-json` cheek picks from the JSON's formats itself, by yt-dlp's rules |
 | `--resolver` | `auto` | `auto`: cheek first, yt-dlp for the big sites; `native` or `yt-dlp` to force one |
 | `-x`, `--audio-format` | `best` | Keep only the sound: `best`, `opus`, `m4a`, `mp3`, `flac`, `wav` |
 | `--merge-output-format` | picked like yt-dlp | `mp4`, `mkv` or `webm` when video and audio are joined |
@@ -78,6 +82,34 @@ Parallel downloading is automatic: direct files use byte ranges when the server 
 Static, unencrypted DASH fragment lists support absolute URLs and paths relative to `fragment_base_url`. Live DASH, encrypted fragments and DASH byte-range fragments are rejected. HLS encryption and byte-range playlists remain unsupported.
 
 Press Ctrl+C and the `.part` file stays. Ranged HTTP downloads also keep a small `.cheek` note of completed chunks and resume on the next run. HLS and DASH fragment downloads restart from the beginning.
+
+### Cineby / CineSrc (desktop)
+
+CineSrc identifies movies and episodes by TMDB ID. Cheek accepts Cineby movie
+links, CineSrc embed links, or a short ID reference:
+
+```bash
+cheek cinesrc:movie:TMDB_ID -J
+cheek cinesrc:tv:TMDB_ID:SEASON:EPISODE -J
+cheek "https://cineby.rocks/movie/TMDB_ID"
+cheek "https://cinesrc.st/embed/tv/TMDB_ID?s=1&e=2"
+```
+
+Replace `TMDB_ID` with the numeric ID. `cineby:` is also accepted as an alias for
+`cinesrc:`. TV references require a season and episode; season 0 supports specials.
+A bare number is ambiguous between movies and series and is not accepted.
+
+The documented CineSrc interface is a JavaScript player, not a direct media API.
+Cheek opens that player in a temporary headless Chrome/Chromium or Edge session,
+observes its HLS request and verifies that the playlist works outside the browser.
+It then closes the browser and downloads through Cheek's normal HLS engine.
+Browser discovery is automatic on desktop; set `CHEEK_BROWSER` to an executable
+path if necessary. Your regular browser profile is not used.
+
+Resolution times out after 90 seconds when the player cannot supply a stream.
+Availability depends on CineSrc and its selected server. Encrypted HLS remains
+unsupported. This resolver needs a desktop browser; Android cannot resolve these
+IDs using the standalone binary. `--resolver yt-dlp` explicitly bypasses it.
 
 ### JSON events
 

@@ -13,6 +13,7 @@ pub mod http;
 pub mod media;
 pub mod merge;
 pub mod run;
+pub mod select;
 pub mod template;
 
 pub use media::{Media, Protocol, Stream, StreamKind};
