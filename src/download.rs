@@ -10,14 +10,14 @@ use crate::http;
 use crate::media::Stream;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
-use reqwest::{Client, StatusCode, header};
+use reqwest::{Client, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::sync::Semaphore;
 
 #[derive(Clone)]
@@ -50,35 +50,40 @@ pub struct Shared {
 
 /// Downloads one HTTP stream to `dest`.
 pub async fn fetch(shared: &Shared, stream: &Stream, dest: &Path) -> Result<u64> {
-    let (total, ranged) = probe(&shared.client, stream).await?;
-    match (total, ranged) {
-        (Some(total), true) if total > 0 => ranged_fetch(shared, stream, dest, total).await,
-        _ => single_fetch(shared, stream, dest, total).await,
-    }
-}
-
-/// Size, and whether the server answers byte ranges.
-async fn probe(client: &Client, stream: &Stream) -> Result<(Option<u64>, bool)> {
-    let resp = http::get(client, stream)
-        .header(header::RANGE, "bytes=0-0")
-        .send()
-        .await
-        .context("connecting")?;
-    let status = resp.status();
-    if status == StatusCode::PARTIAL_CONTENT {
+    let permit = shared.permits.acquire().await?;
+    let resp = probe(&shared.client, stream).await?;
+    if resp.status() == StatusCode::PARTIAL_CONTENT {
         let total = resp
             .headers()
             .get(header::CONTENT_RANGE)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.rsplit('/').next())
             .and_then(|v| v.parse::<u64>().ok())
-            .or(stream.size);
-        return Ok((total, total.is_some()));
+            .or(stream.size)
+            .filter(|n| *n > 0)
+            .context("range response has no file size")?;
+        // Drain the one-byte probe so its connection can be reused.
+        resp.bytes().await?;
+        drop(permit);
+        ranged_fetch(shared, stream, dest, total).await
+    } else {
+        // A server ignoring Range already sent the whole file. Keep that response.
+        single_fetch(shared, dest, resp, stream.size).await
     }
+}
+
+/// Size, and whether the server answers byte ranges.
+async fn probe(client: &Client, stream: &Stream) -> Result<Response> {
+    let resp = http::get(client, stream)
+        .header(header::RANGE, "bytes=0-0")
+        .send()
+        .await
+        .context("connecting")?;
+    let status = resp.status();
     if !status.is_success() {
         bail!("server said {status}");
     }
-    Ok((resp.content_length().or(stream.size), false))
+    Ok(resp)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -96,9 +101,9 @@ fn state_path(dest: &Path) -> PathBuf {
 
 async fn ranged_fetch(shared: &Shared, stream: &Stream, dest: &Path, total: u64) -> Result<u64> {
     let opts = &shared.options;
-    let limit = stream.chunk_limit.unwrap_or(u64::MAX).min(opts.chunk_size);
+    let limit = stream.chunk_limit.unwrap_or(u64::MAX).min(opts.chunk_size).max(1);
     // Enough chunks that every connection stays busy until the end, but none above the limit.
-    let chunk = (total / (opts.connections.max(1) as u64 * 4)).clamp(MIN_CHUNK, limit.max(MIN_CHUNK));
+    let chunk = (total / (opts.connections.clamp(1, 64) as u64 * 4)).clamp(MIN_CHUNK.min(limit), limit);
     let count = total.div_ceil(chunk) as usize;
 
     let sidecar = state_path(dest);
@@ -133,15 +138,16 @@ async fn ranged_fetch(shared: &Shared, stream: &Stream, dest: &Path, total: u64)
 
     let queue: Arc<Mutex<VecDeque<usize>>> = Arc::new(Mutex::new((0..count).filter(|i| !done[*i]).collect()));
     let state = Arc::new(Mutex::new((State { total, chunk, done }, Instant::now())));
-    let workers = opts.connections.max(1).min(queue.lock().unwrap().len().max(1));
+    let workers = opts.connections.clamp(1, 64).min(queue.lock().unwrap().len().max(1));
 
-    let mut tasks = Vec::with_capacity(workers);
+    // Dropping the parent future must also cancel workers writing its files.
+    let mut tasks = tokio::task::JoinSet::new();
     for _ in 0..workers {
         let (queue, state, sidecar) = (queue.clone(), state.clone(), sidecar.clone());
         let (client, permits, progress) = (shared.client.clone(), shared.permits.clone(), shared.progress.clone());
         let (stream, dest) = (stream.clone(), dest.to_path_buf());
-        tasks.push(tokio::spawn(async move {
-            let mut file = OpenOptions::new().write(true).open(&dest).await?;
+        tasks.spawn(async move {
+            let mut file = BufWriter::with_capacity(256 << 10, OpenOptions::new().write(true).open(&dest).await?);
             loop {
                 let Some(i) = queue.lock().unwrap().pop_front() else { break };
                 let _permit = permits.acquire().await?;
@@ -150,6 +156,8 @@ async fn ranged_fetch(shared: &Shared, stream: &Stream, dest: &Path, total: u64)
                 fetch_range(&client, &stream, &mut file, start, end, &progress)
                     .await
                     .with_context(|| format!("bytes {start}-{end}"))?;
+                // A completed chunk must be on disk before its resume marker is saved.
+                file.flush().await?;
                 // Note the chunk; rewrite the sidecar at most once a second.
                 let snapshot = {
                     let mut s = state.lock().unwrap();
@@ -167,11 +175,11 @@ async fn ranged_fetch(shared: &Shared, stream: &Stream, dest: &Path, total: u64)
             }
             file.flush().await?;
             anyhow::Ok(())
-        }));
+        });
     }
     let mut failure = None;
-    for t in tasks {
-        if let Err(e) = t.await.map_err(anyhow::Error::from).and_then(|r| r) {
+    while let Some(t) = tasks.join_next().await {
+        if let Err(e) = t.map_err(anyhow::Error::from).and_then(|r| r) {
             failure.get_or_insert(e);
         }
     }
@@ -184,7 +192,14 @@ async fn ranged_fetch(shared: &Shared, stream: &Stream, dest: &Path, total: u64)
     Ok(total)
 }
 
-async fn fetch_range(client: &Client, stream: &Stream, file: &mut File, start: u64, end: u64, progress: &Progress) -> Result<()> {
+async fn fetch_range(
+    client: &Client,
+    stream: &Stream,
+    file: &mut BufWriter<File>,
+    start: u64,
+    end: u64,
+    progress: &Progress,
+) -> Result<()> {
     let want = end - start + 1;
     let mut attempt = 0;
     loop {
@@ -245,13 +260,11 @@ impl std::fmt::Display for HttpStatus {
 impl std::error::Error for HttpStatus {}
 
 /// One plain request, for servers without range support.
-async fn single_fetch(shared: &Shared, stream: &Stream, dest: &Path, total: Option<u64>) -> Result<u64> {
-    let _permit = shared.permits.acquire().await?;
-    let resp = http::get(&shared.client, stream).send().await?.error_for_status()?;
-    if let Some(t) = total.or(resp.content_length()) {
+async fn single_fetch(shared: &Shared, dest: &Path, resp: Response, total: Option<u64>) -> Result<u64> {
+    if let Some(t) = resp.content_length().or(total) {
         shared.progress.add_total(t);
     }
-    let mut file = File::create(dest).await?;
+    let mut file = BufWriter::with_capacity(256 << 10, File::create(dest).await?);
     let mut body = resp.bytes_stream();
     let mut written = 0u64;
     while let Some(piece) = body.next().await {

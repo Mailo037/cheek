@@ -9,7 +9,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-/// Fast media downloads: parallel ranged HTTP, HLS, resumable, ffmpeg merge.
+/// Fast media downloads: parallel ranged HTTP, HLS/DASH fragments, ffmpeg merge.
 /// Reads yt-dlp's JSON for the sites only yt-dlp knows.
 #[derive(Parser)]
 #[command(name = "cheek", version, about, long_about = None)]
@@ -65,7 +65,7 @@ struct Cli {
     #[arg(long, value_name = "DIR")]
     temp_dir: Option<PathBuf>,
 
-    /// Requests in flight at once.
+    /// Requests in flight across byte chunks or HLS/DASH fragments (shared by video and audio).
     #[arg(short = 'N', long, default_value_t = 8)]
     connections: usize,
 

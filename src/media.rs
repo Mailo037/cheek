@@ -21,6 +21,8 @@ pub enum Protocol {
     Http,
     /// An HLS playlist (`.m3u8`), fetched segment by segment.
     Hls,
+    /// Ordered fragments supplied by a resolver (including the initialization fragment).
+    Fragments,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +45,8 @@ pub struct Stream {
     /// The largest range one request may ask for; some hosts throttle bigger ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fragments: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

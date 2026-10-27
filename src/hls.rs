@@ -10,7 +10,7 @@ use reqwest::Client;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use url::Url;
 
 #[derive(Debug, PartialEq)]
@@ -123,6 +123,11 @@ pub async fn fetch(shared: &Shared, stream: &Stream, dest: &Path, max_height: Op
         bail!("HLS byte-range playlists aren't supported yet; use yt-dlp for it");
     }
     let parts: Vec<String> = playlist.init.into_iter().chain(playlist.segments).collect();
+    fetch_parts(shared, stream, dest, parts).await
+}
+
+/// Fetch an ordered fragment list with bounded concurrency, shared by HLS and DASH.
+pub async fn fetch_parts(shared: &Shared, stream: &Stream, dest: &Path, parts: Vec<String>) -> Result<u64> {
     if parts.is_empty() {
         bail!("the playlist has no segments");
     }
@@ -132,8 +137,11 @@ pub async fn fetch(shared: &Shared, stream: &Stream, dest: &Path, max_height: Op
     let fetched = Arc::new(AtomicU64::new(0));
     let finished = Arc::new(AtomicUsize::new(0));
     let progress = shared.progress.clone();
+    // Each request needs headers, not another copy of the entire fragment list.
+    let mut source = stream.clone();
+    source.fragments.clear();
     let results = futures_util::stream::iter(parts.into_iter().enumerate().map(|(i, url)| {
-        let (client, permits, stream) = (shared.client.clone(), shared.permits.clone(), stream.clone());
+        let (client, permits, stream) = (shared.client.clone(), shared.permits.clone(), source.clone());
         let (fetched, finished, progress) = (fetched.clone(), finished.clone(), progress.clone());
         async move {
             let _p = permits.acquire().await?;
@@ -143,6 +151,15 @@ pub async fn fetch(shared: &Shared, stream: &Stream, dest: &Path, max_height: Op
             let bytes = loop {
                 match async { anyhow::Ok(http::get(&client, &s).send().await?.error_for_status()?.bytes().await?) }.await {
                     Ok(b) => break b,
+                    Err(e)
+                        if e.downcast_ref::<reqwest::Error>().and_then(|e| e.status()).is_some_and(|status| {
+                            status.is_client_error()
+                                && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                                && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                        }) =>
+                    {
+                        return Err(e.context(format!("segment {}", i + 1)));
+                    }
                     Err(e) if attempt >= 4 => return Err(e.context(format!("segment {}", i + 1))),
                     Err(_) => {
                         attempt += 1;
@@ -158,9 +175,9 @@ pub async fn fetch(shared: &Shared, stream: &Stream, dest: &Path, max_height: Op
             anyhow::Ok(bytes)
         }
     }))
-    .buffered(shared.options.connections.max(1) * 2);
+    .buffered(shared.options.connections.clamp(1, 64) * 2);
 
-    let mut out = tokio::fs::File::create(dest).await?;
+    let mut out = BufWriter::with_capacity(256 << 10, tokio::fs::File::create(dest).await?);
     let mut written = 0u64;
     let mut results = std::pin::pin!(results);
     while let Some(piece) = results.next().await {

@@ -36,7 +36,20 @@ pub fn from_info_json(v: &Value) -> Result<Media> {
         Some(list) if !list.is_empty() => list.iter().collect(),
         _ => vec![v],
     };
-    let streams = formats.into_iter().map(stream).collect::<Result<Vec<_>>>()?;
+    let streams = formats
+        .into_iter()
+        .map(|format| {
+            let mut format = format.clone();
+            for key in ["http_headers", "is_live", "has_drm", "extra_param_to_segment_url"] {
+                if format.get(key).is_none()
+                    && let Some(value) = v.get(key)
+                {
+                    format[key] = value.clone();
+                }
+            }
+            stream(&format)
+        })
+        .collect::<Result<Vec<_>>>()?;
     if streams.is_empty() {
         bail!("yt-dlp picked no format");
     }
@@ -56,11 +69,58 @@ pub fn from_info_json(v: &Value) -> Result<Media> {
 
 fn stream(f: &Value) -> Result<Stream> {
     let s = |k: &str| f.get(k).and_then(Value::as_str).map(str::to_string);
-    let url = s("url").context("a format has no URL (DRM or fragmented DASH?)")?;
+    if f.get("has_drm").and_then(Value::as_bool) == Some(true) {
+        bail!("DRM-protected formats aren't supported; use yt-dlp for it");
+    }
+    let url = s("url").or_else(|| s("fragment_base_url")).context("a format has no URL")?;
     let protocol = match s("protocol").as_deref().unwrap_or("https") {
         "http" | "https" => Protocol::Http,
         "m3u8" | "m3u8_native" => Protocol::Hls,
+        "http_dash_segments" | "dash_frag_urls" => Protocol::Fragments,
         other => bail!("protocol {other} isn't supported yet; download this one with yt-dlp"),
+    };
+    let fragments = if protocol == Protocol::Fragments {
+        if f.get("is_live").and_then(Value::as_bool) == Some(true) {
+            bail!("live DASH isn't supported; use yt-dlp for it");
+        }
+        let parts = f
+            .get("fragments")
+            .and_then(Value::as_array)
+            .filter(|p| !p.is_empty())
+            .context("fragmented format has no static fragment list; use yt-dlp to resolve it again")?;
+        let base = url::Url::parse(f.get("fragment_base_url").and_then(Value::as_str).unwrap_or(&url))?;
+        parts
+            .iter()
+            .map(|part| {
+                if part.get("range").is_some() || part.get("byte_range").is_some() || part.get("decrypt_info").is_some() {
+                    bail!("ranged or encrypted DASH fragments aren't supported; use yt-dlp for it");
+                }
+                let href = part
+                    .get("url")
+                    .or_else(|| part.get("path"))
+                    .and_then(Value::as_str)
+                    .context("a fragment has no URL or path")?;
+                let mut fragment = base.join(href)?;
+                if !matches!(fragment.scheme(), "http" | "https") {
+                    bail!("fragment URLs must use HTTP(S)");
+                }
+                if let Some(query) = f.get("extra_param_to_segment_url").and_then(Value::as_str) {
+                    let extra: Vec<_> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+                    let keys: Vec<_> = extra.iter().map(|(k, _)| k.as_str()).collect();
+                    let mut pairs: Vec<_> = fragment
+                        .query_pairs()
+                        .into_owned()
+                        .filter(|(k, _)| !keys.contains(&k.as_str()))
+                        .collect();
+                    pairs.extend(extra);
+                    fragment.set_query(None);
+                    fragment.query_pairs_mut().extend_pairs(pairs);
+                }
+                Ok(fragment.to_string())
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
     };
     let none = |k: &str| s(k).is_some_and(|c| c == "none");
     let kind = match (none("vcodec"), none("acodec")) {
@@ -87,6 +147,7 @@ fn stream(f: &Value) -> Result<Stream> {
         kind,
         protocol,
         headers,
+        fragments,
     })
 }
 
@@ -122,5 +183,48 @@ mod tests {
         let m = from_info_json(&v).unwrap();
         assert_eq!(m.streams[0].protocol, Protocol::Hls);
         assert_eq!(m.streams[0].kind, StreamKind::Muxed);
+    }
+
+    #[test]
+    fn dash_fragments_and_inherited_metadata() {
+        let m = from_info_json(&json!({
+            "http_headers": {"Referer": "https://example.com/watch"},
+            "extra_param_to_segment_url": "token=new",
+            "requested_formats": [{
+                "url": "https://cdn.example.com/manifest.mpd",
+                "fragment_base_url": "https://cdn.example.com/audio/",
+                "protocol": "http_dash_segments", "vcodec": "none", "acodec": "aac", "ext": "m4a",
+                "fragments": [{"path": "init.mp4"}, {"url": "seg.m4s?token=old&x=1"}]
+            }]
+        }))
+        .unwrap();
+        let s = &m.streams[0];
+        assert_eq!(s.protocol, Protocol::Fragments);
+        assert_eq!(s.kind, StreamKind::Audio);
+        assert_eq!(s.headers["Referer"], "https://example.com/watch");
+        assert_eq!(
+            s.fragments,
+            [
+                "https://cdn.example.com/audio/init.mp4?token=new",
+                "https://cdn.example.com/audio/seg.m4s?x=1&token=new"
+            ]
+        );
+        let roundtrip: Media = serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
+        assert_eq!(roundtrip.streams[0].fragments, s.fragments);
+    }
+
+    #[test]
+    fn rejects_incomplete_live_and_encrypted_dash() {
+        let mut v = json!({"url": "https://v/manifest.mpd", "protocol": "http_dash_segments"});
+        assert!(from_info_json(&v).is_err());
+        v["fragments"] = json!([{"path": "init.mp4"}]);
+        v["is_live"] = json!(true);
+        assert!(from_info_json(&v).is_err());
+        v["is_live"] = json!(false);
+        v["has_drm"] = json!(true);
+        assert!(from_info_json(&v).is_err());
+        v["has_drm"] = json!(false);
+        v["fragments"] = json!([{"path": "init.mp4", "range": {"start": 0, "end": 100}}]);
+        assert!(from_info_json(&v).is_err());
     }
 }

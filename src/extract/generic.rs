@@ -102,6 +102,7 @@ fn media_stream(u: &Url, mime: &str, r: &Response) -> Option<Stream> {
             height: None,
             headers: Default::default(),
             chunk_limit: None,
+            fragments: Vec::new(),
         });
     }
     let by_mime = ext_for_mime(mime);
@@ -129,6 +130,7 @@ fn media_stream(u: &Url, mime: &str, r: &Response) -> Option<Stream> {
         height: None,
         headers: Default::default(),
         chunk_limit: None,
+        fragments: Vec::new(),
     })
 }
 

@@ -51,6 +51,12 @@ yt-dlp -J -f "bv*+ba/b" URL | cheek --info-json -
 # Sound only, without re-encoding when the source is already Opus or AAC
 cheek -x URL
 cheek -x --audio-format mp3 URL
+
+# Parallel fragments (HLS or a static DASH fragment list resolved by yt-dlp)
+cheek URL -N 8
+
+# Smaller byte chunks for direct files; connections are shared by video and audio
+cheek https://example.com/talk.mp4 -N 8 --chunk-size 1M
 ```
 
 | Option | Default | |
@@ -67,7 +73,11 @@ cheek -x --audio-format mp3 URL
 | `--json` | | One JSON event per line on stdout, for apps |
 | `-J, --dump-json` | | Print what would be downloaded and stop |
 
-Press Ctrl+C and the `.part` file stays, together with a small `.cheek` note of the chunks that are done. Running the same command again continues from there.
+Parallel downloading is automatic: direct files use byte ranges when the server supports them; HLS and yt-dlp's `http_dash_segments` formats use the supplied fragments. The source determines their duration (for example, 2–6 seconds); `--chunk-size` controls byte ranges, not fragment duration. Initialization fragments are included and all fragments are joined in order without re-encoding. `-N` limits requests across video and audio together; `-N 1` downloads sequentially. More connections help when individual requests are throttled, but cannot exceed your connection or the server's bandwidth.
+
+Static, unencrypted DASH fragment lists support absolute URLs and paths relative to `fragment_base_url`. Live DASH, encrypted fragments and DASH byte-range fragments are rejected. HLS encryption and byte-range playlists remain unsupported.
+
+Press Ctrl+C and the `.part` file stays. Ranged HTTP downloads also keep a small `.cheek` note of completed chunks and resume on the next run. HLS and DASH fragment downloads restart from the beginning.
 
 ### JSON events
 

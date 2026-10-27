@@ -101,6 +101,7 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
                 match s.protocol {
                     Protocol::Http => download::fetch(shared, s, p).await,
                     Protocol::Hls => hls::fetch(shared, s, p, job.max_height).await,
+                    Protocol::Fragments => hls::fetch_parts(shared, s, p, s.fragments.clone()).await,
                 }
                 .with_context(|| format!("downloading {}", s.format_id.as_deref().unwrap_or("the stream")))
             }
@@ -133,7 +134,7 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
     let merged = temp_dir.join(format!("cheek-merge-{}.{ext}", std::process::id()));
     if job.audio.is_some() {
         let source_ext = files[0].extension().and_then(|e| e.to_str()).unwrap_or("");
-        if source_ext.eq_ignore_ascii_case(&ext) && streams[0].kind == StreamKind::Audio && streams[0].protocol == Protocol::Http {
+        if source_ext.eq_ignore_ascii_case(&ext) && streams[0].kind == StreamKind::Audio && streams[0].protocol != Protocol::Hls {
             move_file(&files[0], &final_path).await?;
         } else {
             reporter.emit(&Event::Stage { stage: "extracting audio" });
@@ -195,7 +196,7 @@ fn final_ext(job: &Job, streams: &[&Stream]) -> String {
     match streams[0].protocol {
         Protocol::Hls if job.ffmpeg.is_some() => job.merge_format.clone().unwrap_or_else(|| "mp4".into()),
         Protocol::Hls => "ts".into(),
-        Protocol::Http => streams[0].ext.clone(),
+        Protocol::Http | Protocol::Fragments => streams[0].ext.clone(),
     }
 }
 

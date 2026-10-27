@@ -85,6 +85,7 @@ fn stream(url: String) -> Stream {
         height: None,
         headers: Default::default(),
         chunk_limit: None,
+        fragments: Vec::new(),
     }
 }
 
@@ -130,11 +131,24 @@ async fn retries_dropped_connections() {
 #[tokio::test]
 async fn falls_back_without_ranges() {
     let data = body(2 * 1024 * 1024 + 5);
-    let (url, _) = serve(data.clone(), false, 0).await;
+    let (url, hits) = serve(data.clone(), false, 0).await;
     let dir = tempdir();
     let dest = dir.join("c.mp4");
     fetch(&shared(8), &stream(url), &dest).await.unwrap();
     assert_eq!(std::fs::read(&dest).unwrap(), *data);
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "reuse the full response from the probe");
+}
+
+#[tokio::test]
+async fn respects_small_chunk_limits() {
+    let data = body(256 * 1024);
+    let (url, hits) = serve(data.clone(), true, 0).await;
+    let mut stream = stream(url);
+    stream.chunk_limit = Some(64 << 10);
+    let dest = tempdir().join("small.mp4");
+    fetch(&shared(2), &stream, &dest).await.unwrap();
+    assert_eq!(std::fs::read(dest).unwrap(), *data);
+    assert_eq!(hits.load(Ordering::SeqCst), 5);
 }
 
 #[tokio::test]
