@@ -49,7 +49,8 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
 
     let ext = final_ext(&job, &streams);
     let final_path = job.out_dir.join(template::render(&job.template, media, &ext));
-    if final_path.exists() {
+    // An empty leftover from a failed run doesn't count as done.
+    if final_path.metadata().is_ok_and(|m| m.len() > 0) {
         reporter.emit(&Event::Stage {
             stage: "already downloaded",
         });
@@ -125,6 +126,11 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
             .as_ref()
             .with_context(|| format!("ffmpeg is needed to {why}; install it or pass --ffmpeg"))
     };
+    // ffmpeg writes next to the parts and the result moves into place at the end, so the
+    // output folder never holds a half-written file (and ffmpeg never has to write to
+    // storage it can't seek in, like Android's shared folders).
+    // A plain name: ffmpeg reads `%` in output names as an image-sequence pattern.
+    let merged = temp_dir.join(format!("cheek-merge-{}.{ext}", std::process::id()));
     if job.audio.is_some() {
         let source_ext = files[0].extension().and_then(|e| e.to_str()).unwrap_or("");
         if source_ext.eq_ignore_ascii_case(&ext) && streams[0].kind == StreamKind::Audio && streams[0].protocol == Protocol::Http {
@@ -132,19 +138,23 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
         } else {
             reporter.emit(&Event::Stage { stage: "extracting audio" });
             need_ffmpeg("extract the audio")?
-                .audio(&files[0], streams[0].codec.as_deref(), &final_path, media)
+                .audio(&files[0], streams[0].codec.as_deref(), &merged, media)
                 .await?;
+            move_file(&merged, &final_path).await?;
         }
     } else if files.len() > 1 {
         reporter.emit(&Event::Stage { stage: "merging" });
-        need_ffmpeg("merge video and audio")?.mux(&files, &final_path, media).await?;
+        let hls = streams.iter().any(|s| s.protocol == Protocol::Hls);
+        need_ffmpeg("merge video and audio")?.mux(&files, &merged, media, hls).await?;
+        move_file(&merged, &final_path).await?;
     } else if streams[0].protocol == Protocol::Hls && ext != "ts" {
         reporter.emit(&Event::Stage { stage: "remuxing" });
-        need_ffmpeg("remux the HLS stream")?.mux(&files, &final_path, media).await?;
+        need_ffmpeg("remux the HLS stream")?.mux(&files, &merged, media, true).await?;
+        move_file(&merged, &final_path).await?;
     } else {
         move_file(&files[0], &final_path).await?;
     }
-    for f in &files {
+    for f in files.iter().chain([&merged]) {
         if f != &final_path {
             tokio::fs::remove_file(f).await.ok();
         }

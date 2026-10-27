@@ -39,7 +39,8 @@ impl Ffmpeg {
     }
 
     /// Copies the streams of all inputs into `out`, video from the first, audio from the last.
-    pub async fn mux(&self, inputs: &[PathBuf], out: &Path, media: &Media) -> Result<()> {
+    /// `from_hls` marks MPEG-TS input, whose AAC needs repacking for MP4.
+    pub async fn mux(&self, inputs: &[PathBuf], out: &Path, media: &Media, from_hls: bool) -> Result<()> {
         let mut args: Vec<std::ffi::OsString> = Vec::new();
         for i in inputs {
             args.extend(["-i".into(), i.into()]);
@@ -56,7 +57,11 @@ impl Ffmpeg {
         let ext = ext_of(out);
         if ext == "mp4" || ext == "m4a" || ext == "mov" {
             // HLS transport streams carry AAC in ADTS frames, which MP4 can't hold as they are.
-            args.extend(["-bsf:a".into(), "aac_adtstoasc".into(), "-movflags".into(), "+faststart".into()]);
+            // Only then: the filter refuses other codecs, like the Opus YouTube often serves.
+            if from_hls {
+                args.extend(["-bsf:a".into(), "aac_adtstoasc".into()]);
+            }
+            args.extend(["-movflags".into(), "+faststart".into()]);
         }
         args.extend(metadata(media));
         args.push(out.into());

@@ -62,7 +62,11 @@ pub fn parse_master(text: &str, base: &Url) -> Option<Vec<Variant>> {
             && !line.starts_with('#')
             && let Some((bandwidth, height)) = pending.take()
         {
-            out.push(Variant { url: join(base, line), bandwidth, height });
+            out.push(Variant {
+                url: join(base, line),
+                bandwidth,
+                height,
+            });
         }
     }
     Some(out)

@@ -7,7 +7,8 @@ use crate::media::Media;
 use regex::Regex;
 use std::sync::LazyLock;
 
-static FIELD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"%\((\w+)\)(?:\.(\d+)B)?s").unwrap());
+// `%(f)s`, or `%(f).NB` where `B` is yt-dlp's "cut to N bytes" conversion (no trailing `s`).
+static FIELD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"%\((\w+)\)(?:\.(\d+)B|s)").unwrap());
 
 pub fn render(template: &str, media: &Media, ext: &str) -> String {
     let out = FIELD.replace_all(template, |c: &regex::Captures| {
@@ -91,7 +92,8 @@ mod tests {
     #[test]
     fn cuts_on_char_boundaries() {
         let m = media("Ääää");
-        assert_eq!(render("%(title).3Bs", &m, "mp4"), "Ä");
+        assert_eq!(render("%(title).3B", &m, "mp4"), "Ä");
+        assert_eq!(render("%(title).150B [%(id)s].%(ext)s", &m, "mp4"), "Ääää [abc123].mp4");
     }
 
     #[test]
