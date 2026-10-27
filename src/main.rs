@@ -78,6 +78,14 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     ffmpeg: Option<PathBuf>,
 
+    /// Write the thumbnail into the file as its cover (mp4, m4a, mkv, mp3, opus, ogg, flac).
+    #[arg(long)]
+    embed_thumbnail: bool,
+
+    /// Write title, artist and link into every file, even one that needed no ffmpeg step.
+    #[arg(long)]
+    embed_metadata: bool,
+
     /// Machine-readable events on stdout, one JSON object per line.
     #[arg(long)]
     json: bool,
@@ -175,6 +183,8 @@ async fn go(cli: Cli, reporter: &Reporter) -> Result<()> {
             connections: cli.connections.clamp(1, 64),
             chunk_size: cli.chunk_size.max(64 << 10),
         },
+        embed_thumbnail: cli.embed_thumbnail,
+        embed_metadata: cli.embed_metadata,
     };
     let client = http::download_client(cli.user_agent.as_deref(), job.options.connections)?;
     cheek::run(client, job, reporter).await?;

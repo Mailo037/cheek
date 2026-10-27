@@ -7,10 +7,12 @@ use crate::media::Stream;
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use reqwest::Client;
-use std::path::Path;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use tokio::io::{AsyncWriteExt, BufWriter};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use url::Url;
 
 #[derive(Debug, PartialEq)]
@@ -126,21 +128,72 @@ pub async fn fetch(shared: &Shared, stream: &Stream, dest: &Path, max_height: Op
     fetch_parts(shared, stream, dest, parts).await
 }
 
+/// How far an interrupted fragment download got: the first `written` fragments, `bytes` long.
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct Notes {
+    count: usize,
+    /// The first and last fragment without their query, which often carries expiring tokens.
+    key: String,
+    written: usize,
+    bytes: u64,
+}
+
+fn notes_path(dest: &Path) -> PathBuf {
+    let mut p = dest.as_os_str().to_owned();
+    p.push(".cheek");
+    PathBuf::from(p)
+}
+
+/// Names the fragment list so a later run can tell whether it is the same one.
+fn list_key(parts: &[String]) -> String {
+    let bare = |u: &String| u.split(['?', '#']).next().unwrap_or(u).to_string();
+    format!(
+        "{}|{}",
+        parts.first().map(bare).unwrap_or_default(),
+        parts.last().map(bare).unwrap_or_default()
+    )
+}
+
+/// The fragments already on disk from an earlier run, cutting off anything past the last
+/// noted one. Anything that doesn't match starts over from the first fragment.
+async fn resume_point(dest: &Path, count: usize, key: &str) -> (usize, u64) {
+    let Ok(bytes) = tokio::fs::read(notes_path(dest)).await else {
+        return (0, 0);
+    };
+    let Ok(notes) = serde_json::from_slice::<Notes>(&bytes) else {
+        return (0, 0);
+    };
+    let len = tokio::fs::metadata(dest).await.map(|m| m.len()).unwrap_or(0);
+    if notes.count != count || notes.key != key || notes.written == 0 || notes.written >= count || len < notes.bytes {
+        return (0, 0);
+    }
+    (notes.written, notes.bytes)
+}
+
 /// Fetch an ordered fragment list with bounded concurrency, shared by HLS and DASH.
+/// Fragments that an earlier, interrupted run already wrote are kept and skipped.
 pub async fn fetch_parts(shared: &Shared, stream: &Stream, dest: &Path, parts: Vec<String>) -> Result<u64> {
     if parts.is_empty() {
         bail!("the playlist has no segments");
     }
 
-    // Segments land in memory and are written in order as soon as the next one is there.
     let count = parts.len();
-    let fetched = Arc::new(AtomicU64::new(0));
-    let finished = Arc::new(AtomicUsize::new(0));
+    let key = list_key(&parts);
+    let sidecar = notes_path(dest);
+    let (skip, kept) = resume_point(dest, count, &key).await;
     let progress = shared.progress.clone();
+    if skip > 0 {
+        progress.add(kept);
+        progress.set_total_at_least(kept * count as u64 / skip as u64);
+    }
+
+    // Segments land in memory and are written in order as soon as the next one is there.
+    let fetched = Arc::new(AtomicU64::new(kept));
+    let finished = Arc::new(AtomicUsize::new(skip));
     // Each request needs headers, not another copy of the entire fragment list.
     let mut source = stream.clone();
     source.fragments.clear();
-    let results = futures_util::stream::iter(parts.into_iter().enumerate().map(|(i, url)| {
+    let results = futures_util::stream::iter(parts.into_iter().enumerate().skip(skip).map(|(i, url)| {
         let (client, permits, stream) = (shared.client.clone(), shared.permits.clone(), source.clone());
         let (fetched, finished, progress) = (fetched.clone(), finished.clone(), progress.clone());
         async move {
@@ -177,17 +230,51 @@ pub async fn fetch_parts(shared: &Shared, stream: &Stream, dest: &Path, parts: V
     }))
     .buffered(shared.options.connections.clamp(1, 64) * 2);
 
-    let mut out = BufWriter::with_capacity(256 << 10, tokio::fs::File::create(dest).await?);
-    let mut written = 0u64;
+    let file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(skip == 0)
+        .open(dest)
+        .await
+        .with_context(|| format!("creating {}", dest.display()))?;
+    // A fragment that was only half written when the last run stopped goes again.
+    file.set_len(kept).await?;
+    let mut out = BufWriter::with_capacity(256 << 10, file);
+    out.seek(std::io::SeekFrom::Start(kept)).await?;
+    let mut notes = Notes {
+        count,
+        key,
+        written: skip,
+        bytes: kept,
+    };
+    let mut noted = Instant::now();
     let mut results = std::pin::pin!(results);
-    while let Some(piece) = results.next().await {
-        let piece = piece?;
-        out.write_all(&piece).await?;
-        written += piece.len() as u64;
+    let outcome: Result<()> = async {
+        while let Some(piece) = results.next().await {
+            let piece = piece?;
+            out.write_all(&piece).await?;
+            notes.written += 1;
+            notes.bytes += piece.len() as u64;
+            // The bytes must be on disk before the note that counts them; at most once a second.
+            if noted.elapsed() > Duration::from_secs(1) {
+                noted = Instant::now();
+                out.flush().await?;
+                tokio::fs::write(&sidecar, serde_json::to_vec(&notes)?).await.ok();
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = outcome {
+        if out.flush().await.is_ok() && notes.written > 0 {
+            tokio::fs::write(&sidecar, serde_json::to_vec(&notes)?).await.ok();
+        }
+        return Err(e);
     }
     out.flush().await?;
-    progress.set_total_at_least(written);
-    Ok(written)
+    tokio::fs::remove_file(&sidecar).await.ok();
+    progress.set_total_at_least(notes.bytes);
+    Ok(notes.bytes)
 }
 
 #[cfg(test)]

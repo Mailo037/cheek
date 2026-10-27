@@ -90,6 +90,8 @@ async fn parallel_fragments_preserve_order_and_retry() {
             merge_format: None,
             max_height: None,
             ffmpeg: None,
+            embed_thumbnail: false,
+            embed_metadata: false,
             options: Options {
                 connections: 3,
                 ..Options::default()
@@ -143,6 +145,78 @@ async fn missing_fragment_fails_without_retries() {
     let s = &media.streams[0];
     assert!(cheek::hls::fetch_parts(&shared, s, &dest, s.fragments.clone()).await.is_err());
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+    std::fs::remove_file(dest).unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn interrupted_fragments_resume_where_they_stopped() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    // Fragment 4 is missing on the first run; every request is counted by index.
+    let broken = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let hits: Arc<Vec<AtomicUsize>> = Arc::new((0..6).map(|_| AtomicUsize::new(0)).collect());
+    let (b, h) = (broken.clone(), hits.clone());
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let (b, h) = (b.clone(), h.clone());
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    if sock.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    request.push(byte[0]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let path = request.split_whitespace().nth(1).unwrap();
+                let i: usize = path.trim_start_matches('/').split('?').next().unwrap().parse().unwrap();
+                h[i].fetch_add(1, Ordering::SeqCst);
+                let missing = i == 4 && b.load(Ordering::SeqCst);
+                let body = if missing { Vec::new() } else { vec![i as u8 + 1; 50_000 + i] };
+                let status = if missing { "404 Not Found" } else { "200 OK" };
+                let head = format!("HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n", body.len());
+                sock.write_all(head.as_bytes()).await.unwrap();
+                sock.write_all(&body).await.unwrap();
+            });
+        }
+    });
+    let shared = || Shared {
+        client: cheek::http::download_client(None, 1).unwrap(),
+        permits: Arc::new(Semaphore::new(1)),
+        progress: Arc::new(Progress::default()),
+        options: Options {
+            connections: 1,
+            ..Options::default()
+        },
+    };
+    // The second resolve hands out fresh tokens for the same fragments.
+    let parts = |token: &str| (0..6).map(|i| format!("{base}{i}?token={token}")).collect::<Vec<_>>();
+    let media = from_info_json(&serde_json::json!({
+        "url": format!("{base}manifest.mpd"), "protocol": "http_dash_segments", "vcodec": "none", "acodec": "aac", "ext": "m4a",
+        "fragments": [{"url": format!("{base}0")}]
+    }))
+    .unwrap();
+    let stream = &media.streams[0];
+    let dest = std::env::temp_dir().join(format!("cheek-fragment-resume-{}.m4a", std::process::id()));
+    let notes = std::path::PathBuf::from(format!("{}.cheek", dest.display()));
+
+    assert!(cheek::hls::fetch_parts(&shared(), stream, &dest, parts("a")).await.is_err());
+    assert!(notes.exists(), "the first run leaves its notes");
+
+    broken.store(false, Ordering::SeqCst);
+    let again = shared();
+    let size = cheek::hls::fetch_parts(&again, stream, &dest, parts("b")).await.unwrap();
+    let expected: Vec<u8> = (0..6).flat_map(|i| vec![i as u8 + 1; 50_000 + i]).collect();
+    assert_eq!(std::fs::read(&dest).unwrap(), expected);
+    assert_eq!(size, expected.len() as u64);
+    assert_eq!(again.progress.snapshot().0, size, "kept fragments count as done");
+    for i in 0..4 {
+        assert_eq!(hits[i].load(Ordering::SeqCst), 1, "fragment {i} was fetched again");
+    }
+    assert!(!notes.exists(), "a finished download drops its notes");
     std::fs::remove_file(dest).unwrap();
     server.abort();
 }
