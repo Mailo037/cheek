@@ -137,21 +137,13 @@ Download a binary from the [latest release](https://github.com/Mailo037/cheek/re
 | `cheek-aarch64-macos`, `cheek-x86_64-macos` | macOS |
 | `cheek-android-arm64-v8a`, `-armeabi-v7a`, `-x86_64` | Android apps that ship it as `libcheek.so` |
 
-Or build it:
+Or install it with Cargo:
 
 ```bash
 cargo install --git https://github.com/Mailo037/cheek
 ```
 
 ffmpeg is only needed for merging, audio extraction and HLS remuxing; a single-file download works without it. yt-dlp is only needed for the sites cheek doesn't resolve by itself.
-
-### Android
-
-```bash
-cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 --platform 26 build --release
-```
-
-TLS uses rustls with bundled Mozilla roots, so the binary runs as a plain process inside an app, with no JNI. Hamstr packs it as `libcheek.so`; the system extracts it next to the app's other native libraries and the app runs it from there.
 
 ## How it works
 
@@ -170,11 +162,6 @@ TLS uses rustls with bundled Mozilla roots, so the binary runs as a plain proces
                                                                   ▼
                                                             finished file
 ```
-
-- `src/download.rs`: ranged downloads. Chunk sizes adapt so that every connection stays busy to the end. Failed ranges retry with backoff, without counting their bytes twice.
-- `src/hls.rs`: master and media playlists, init segments, parallel segments written in order.
-- `src/extract/`: the generic extractor and the yt-dlp JSON reader.
-- `src/merge.rs`: ffmpeg calls that copy streams; they only re-encode when you ask for a different audio format.
 
 ## License
 
