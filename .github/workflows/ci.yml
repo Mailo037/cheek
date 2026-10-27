@@ -39,6 +39,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-ndk --locked
       - name: Build for Android
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
         run: cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 --platform 26 build --release

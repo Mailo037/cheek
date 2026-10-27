@@ -49,8 +49,6 @@ jobs:
           targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
       - run: cargo install cargo-ndk --locked
       - name: Build
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
         run: cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 --platform 26 build --release --locked
       - name: Rename
         run: |
