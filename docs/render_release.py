@@ -12,12 +12,12 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 CANVAS, OVERLAY, LINE = (20, 20, 20), (30, 30, 30), (54, 54, 54)
 INK, MUTED, GHOST, ACCENT, GREEN = (238, 238, 238), (170, 170, 170), (138, 138, 138), (255, 154, 60), (16, 185, 129)
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 FEATURES = [
-    ("RESUME KEEPS ITS PLACE", "Finished chunks count after a new -N too"),
-    ("NO SECOND START", "Fewer or more connections, same file"),
+    ("GLYPH SHARES", "Resolve songs and playlists from their links"),
+    ("KEEP THE REST", "One failed song does not stop the playlist"),
 ]
-HEADLINE = ("Pause with 12 connections,", "pick up with 4.")
+HEADLINE = ("Shared songs,", "kept in order.")
 
 
 def main():
@@ -70,15 +70,15 @@ def main():
     tf = f("jetbrains_mono_400.ttf", 27)
     tb = f("jetbrains_mono_600.ttf", 27)
     lines = [
-        [("$ ", GHOST), ("cheek ", ACCENT), ("-N 12 https://…/film.mp4", INK)],
-        [("[cheek] ", GHOST), ("12 connections, 1 MiB chunks", MUTED)],
-        [("^C", GHOST)],
-        [("[cheek] ", GHOST), ("stopped at 812 of 1340 MiB", MUTED)],
+        [("$ ", GHOST), ("cheek ", ACCENT), ("https://glyph.my/p/SHARE_ID", INK)],
+        [("[Glyph] ", GHOST), ("resolve the shared playlist", MUTED)],
         [],
-        [("$ ", GHOST), ("cheek ", ACCENT), ("-N 4 https://…/film.mp4", INK)],
-        [("[cheek] ", GHOST), ("resuming with the saved chunks", INK)],
-        "BAR",
-        [("        -> ", GHOST), ("film.mp4", GREEN)],
+        [("[1/3] ", GHOST), ("first song downloaded", GREEN)],
+        [("[2/3] ", GHOST), ("source unavailable, continuing", MUTED)],
+        [("[3/3] ", GHOST), ("last song downloaded", GREEN)],
+        [],
+        [("[cheek] ", GHOST), ("2 saved, 1 failed", INK)],
+        [("        ", GHOST), ("previews stay clearly marked", MUTED)],
     ]
     y = py + 100
     for parts in lines:

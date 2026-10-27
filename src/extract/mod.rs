@@ -2,12 +2,30 @@
 
 pub mod cinesrc;
 pub mod generic;
+pub mod glyph;
 pub mod ytdlp;
 
 use crate::media::Media;
 use anyhow::{Result, bail};
 use reqwest::Client;
 use std::path::PathBuf;
+
+/// Single media keeps the existing JSON shape; playlists contain unresolved entry links.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum Resolved {
+    Media(Media),
+    Playlist(glyph::Playlist),
+}
+
+pub async fn resolve_input(client: &Client, url: &str, opts: &ResolveOptions) -> Result<Resolved> {
+    if opts.resolver != Resolver::YtDlp
+        && let Some(target) = glyph::Target::parse(url)?
+    {
+        return glyph::resolve(client, &target).await;
+    }
+    resolve(client, url, opts).await.map(Resolved::Media)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Resolver {
@@ -71,6 +89,11 @@ pub fn which(name: &str) -> Option<PathBuf> {
 }
 
 pub async fn resolve(client: &Client, url: &str, opts: &ResolveOptions) -> Result<Media> {
+    if opts.resolver != Resolver::YtDlp
+        && let Some(target) = glyph::Target::parse(url)?
+    {
+        return glyph::extract(client, &target).await;
+    }
     if opts.resolver != Resolver::YtDlp
         && let Some(target) = cinesrc::Target::parse(url)?
     {

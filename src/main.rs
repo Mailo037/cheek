@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use cheek::download::Options;
 use cheek::events::{Event, Reporter};
-use cheek::extract::{self, ResolveOptions, Resolver};
+use cheek::extract::{self, ResolveOptions, Resolved, Resolver};
 use cheek::merge::Ffmpeg;
 use cheek::{Job, Media, http, select};
 use clap::Parser;
@@ -134,7 +134,13 @@ async fn main() -> ExitCode {
 }
 
 async fn go(cli: Cli, reporter: &Reporter) -> Result<()> {
-    let media: Media = match (&cli.info_json, &cli.url) {
+    let opts = ResolveOptions {
+        resolver: cli.resolver,
+        yt_dlp: cli.yt_dlp.clone(),
+        format: cli.format.clone().unwrap_or_else(|| "bv*+ba/b".into()),
+    };
+    let client = http::page_client(cli.user_agent.as_deref())?;
+    let resolved = match (&cli.info_json, &cli.url) {
         (Some(path), _) => {
             let text = if path.as_os_str() == "-" {
                 let mut s = String::new();
@@ -145,38 +151,57 @@ async fn go(cli: Cli, reporter: &Reporter) -> Result<()> {
             };
             let value: serde_json::Value = serde_json::from_str(&text).context("the info JSON isn't valid JSON")?;
             // Either yt-dlp's info dict or cheek's own -J output.
-            if value.get("streams").is_some() {
-                serde_json::from_value(value)?
+            if value.get("_type").and_then(serde_json::Value::as_str) == Some("playlist") {
+                Resolved::Playlist(serde_json::from_value(value)?)
+            } else if value.get("streams").is_some() {
+                Resolved::Media(serde_json::from_value(value)?)
             } else if let Some(spec) = &cli.format {
-                extract::ytdlp::from_info_json(&select::apply(&value, spec)?)?
+                Resolved::Media(extract::ytdlp::from_info_json(&select::apply(&value, spec)?)?)
             } else {
-                extract::ytdlp::from_info_json(&value)?
+                Resolved::Media(extract::ytdlp::from_info_json(&value)?)
             }
         }
-        (None, Some(url)) => {
-            let client = http::page_client(cli.user_agent.as_deref())?;
-            let opts = ResolveOptions {
-                resolver: cli.resolver,
-                yt_dlp: cli.yt_dlp.clone(),
-                format: cli.format.clone().unwrap_or_else(|| "bv*+ba/b".into()),
-            };
-            extract::resolve(&client, url, &opts).await?
-        }
+        (None, Some(url)) => extract::resolve_input(&client, url, &opts).await?,
         (None, None) => bail!("give a link, or --info-json with yt-dlp's JSON"),
     };
 
     if cli.dump_json {
-        println!("{}", serde_json::to_string_pretty(&media)?);
+        println!("{}", serde_json::to_string_pretty(&resolved)?);
         return Ok(());
     }
 
+    match resolved {
+        Resolved::Media(media) => download(&cli, media, reporter).await,
+        Resolved::Playlist(playlist) => {
+            anyhow::ensure!(!playlist.entries.is_empty(), "playlist contains no songs");
+            let mut failed = 0;
+            for entry in playlist.entries {
+                let result = async {
+                    let media = extract::resolve(&client, &entry.url, &opts).await?;
+                    download(&cli, media, reporter).await
+                }
+                .await;
+                if let Err(error) = result {
+                    failed += 1;
+                    reporter.emit(&Event::Error {
+                        message: &format!("{}: {error:#}", entry.title),
+                    });
+                }
+            }
+            anyhow::ensure!(failed == 0, "{failed} playlist song(s) failed; other songs were downloaded");
+            Ok(())
+        }
+    }
+}
+
+async fn download(cli: &Cli, media: Media, reporter: &Reporter) -> Result<()> {
     let job = Job {
         media,
-        out_dir: cli.paths,
-        temp_dir: cli.temp_dir,
-        template: cli.output,
+        out_dir: cli.paths.clone(),
+        temp_dir: cli.temp_dir.clone(),
+        template: cli.output.clone(),
         audio: cli.extract_audio.then(|| cli.audio_format.to_ascii_lowercase()),
-        merge_format: cli.merge_output_format,
+        merge_format: cli.merge_output_format.clone(),
         max_height: cli.max_height,
         ffmpeg: Ffmpeg::find(cli.ffmpeg.as_ref()),
         options: Options {

@@ -18,6 +18,7 @@ A download has two halves. **Resolving** works out which streams a link has and 
 - **Fetching is where cheek wins.** A single HTTP connection rarely fills a fast line: TCP ramps up slowly, and many CDNs pace each connection. Eight connections that each pull their own range fill the line instead.
 - **Resolving stays with [yt-dlp](https://github.com/yt-dlp/yt-dlp).** It has extractors for more than 1,800 sites, and maintainers fix them every week as the sites change. A rewrite would fall behind within days. So for YouTube, Instagram, TikTok and the like, cheek reads yt-dlp's JSON and takes over from there.
 - **Direct links, HLS playlists and ordinary web pages** (`og:video`, `<video>`, JSON-LD) are resolved by cheek alone, with no Python involved.
+- **Glyph shares** (`https://glyph.my/p/<id>`) resolve natively with titles, artists and covers. Playlists and albums download in order, resolving each song just before downloading; `-J` lists their entries without resolving every audio source. Select one song using `/p/<id>/listen/<index>` (zero-based). Official 30-second previews are marked in the title. Embed links also work. Glyph's public web player currently exposes at most 200 songs; larger lists fail explicitly instead of being truncated. Unavailable songs are reported while the rest of a playlist continues.
 
 ## Benchmarks
 
