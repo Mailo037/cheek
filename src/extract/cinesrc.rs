@@ -34,13 +34,8 @@ impl Target {
                 return Ok(None);
             }
             ensure!(matches!(u.scheme(), "http" | "https"), "CineSrc links require HTTP or HTTPS");
-            let parts = u
-                .path()
-                .trim_matches('/')
-                .split('/')
-                .filter(|p| *p != "embed")
-                .map(str::to_owned)
-                .collect();
+            let path = u.path().trim_matches('/');
+            let parts = path.strip_prefix("embed/").unwrap_or(path).split('/').map(str::to_owned).collect();
             (parts, u.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect())
         };
         let usage = "use cinesrc:movie:TMDB_ID or cinesrc:tv:TMDB_ID:SEASON:EPISODE";
@@ -268,13 +263,6 @@ async fn resolve(client: &Client, target: &Target) -> Result<Media> {
                     .as_str()
                     .and_then(|u| Url::parse(u).ok())
                     .is_some_and(|u| u.path().ends_with(".m3u8"));
-                if p["frameId"].as_str() == Some(frame_id.as_str()) && is_playlist {
-                    ensure!(
-                        response["status"].as_u64().is_some_and(|s| (200..300).contains(&s)),
-                        "CineSrc's playlist endpoint returned HTTP {}; the selected server is unavailable or denied access",
-                        response["status"]
-                    );
-                }
                 if p["frameId"].as_str() == Some(frame_id.as_str())
                     && response["status"].as_u64().is_some_and(|s| (200..300).contains(&s))
                     && (is_playlist
@@ -313,17 +301,6 @@ async fn resolve(client: &Client, target: &Target) -> Result<Media> {
             .into(),
     );
     headers.entry("referer".into()).or_insert_with(|| target.embed());
-    let cookies = cdp.call("Network.getCookies", json!({"urls":[stream_url]})).await?;
-    let cookie = cookies["cookies"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|c| Some(format!("{}={}", c["name"].as_str()?, c["value"].as_str()?)))
-        .collect::<Vec<_>>()
-        .join("; ");
-    if !cookie.is_empty() {
-        headers.insert("cookie".into(), cookie);
-    }
     // Confirm that the observed URL also works outside the browser before returning it.
     let mut request = client.get(&stream_url);
     for (k, v) in &headers {
