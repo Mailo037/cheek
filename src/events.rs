@@ -11,9 +11,16 @@ use std::time::{Duration, Instant};
 pub struct Progress {
     total: AtomicU64,
     done: AtomicU64,
+    pressure: AtomicU64,
 }
 
 impl Progress {
+    pub fn throttled(&self) {
+        self.pressure.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn pressure(&self) -> u64 {
+        self.pressure.load(Ordering::Relaxed)
+    }
     pub fn add_total(&self, n: u64) {
         self.total.fetch_add(n, Ordering::Relaxed);
     }

@@ -167,6 +167,37 @@ ffmpeg is only needed for merging, audio extraction and HLS remuxing; a single-f
                                                             finished file
 ```
 
+## Transfer tuning and measurement
+
+Parallelism adapts by default: it starts at up to two requests, tests higher counts
+against measured throughput, and backs off on failures or throttling. `-N` is the
+maximum, shared by audio and video. `--fixed-connections` keeps that count fixed.
+`--power-save` caps it at two; battery savings must be measured on the actual phone.
+Interrupted range requests continue at the last received byte during retries;
+process restarts still resume completed chunks from the sidecar.
+
+HTTP/1.1 remains the default. `--http-protocol auto` allows HTTP/2 negotiation for
+comparisons against real HTTPS media hosts. Local benchmarks only exercise HTTP/1.1.
+Retries honor Retry-After seconds and dates, with jitter. Fragments finish out of
+order into temporary disk files, then join in order with bounded memory use.
+Stream-based covers convert inside the final FFmpeg operation; attachment/comment
+covers still need a separate conversion when their image format is incompatible.
+
+```sh
+cargo build --release
+python tools/benchmark.py --binary target/release/cheek --runs 3
+python tools/benchmark.py --binary target/release/cheek --baseline /path/to/old-cheek
+python tools/benchmark.py --binary target/release/cheek --url 'https://example.com/media.mp4'
+```
+
+The benchmark checks byte-exact range and fragment output and writes JSON with
+wall time, event-derived phase timings, and sampled CPU/RSS if `psutil` is installed.
+Its local fixture includes a slow initial fragment. Use real media with
+`--extra-arg=--embed-thumbnail` and `--extra-arg=--embed-metadata` to measure FFmpeg.
+CPU samples are approximate and can miss short-lived children. Android energy
+requires separate `adb shell dumpsys batterystats` measurements under equal network,
+screen and charging conditions; desktop timings do not establish battery savings.
+
 ## License
 
 [Unlicense](LICENSE), public domain, like yt-dlp.

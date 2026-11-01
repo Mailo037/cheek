@@ -70,6 +70,16 @@ struct Cli {
     #[arg(short = 'N', long, default_value_t = 8)]
     connections: usize,
 
+    /// Disable adaptive parallelism for reproducible comparisons.
+    #[arg(long)]
+    fixed_connections: bool,
+    /// Cap parallel requests at two for less radio and CPU activity.
+    #[arg(long)]
+    power_save: bool,
+    /// HTTP/1.1 or automatic negotiation (including HTTP/2).
+    #[arg(long, default_value = "http1", value_parser = ["http1", "auto"])]
+    http_protocol: String,
+
     /// Largest byte range per request, e.g. 4M or 512K.
     #[arg(long, default_value = "8M", value_parser = parse_size)]
     chunk_size: u64,
@@ -205,13 +215,18 @@ async fn download(cli: &Cli, media: Media, reporter: &Reporter) -> Result<()> {
         max_height: cli.max_height,
         ffmpeg: Ffmpeg::find(cli.ffmpeg.as_ref()),
         options: Options {
-            connections: cli.connections.clamp(1, 64),
+            connections: cli.connections.clamp(1, if cli.power_save { 2 } else { 64 }),
+            adaptive: !cli.fixed_connections,
             chunk_size: cli.chunk_size.max(64 << 10),
         },
         embed_thumbnail: cli.embed_thumbnail,
         embed_metadata: cli.embed_metadata,
     };
-    let client = http::download_client(cli.user_agent.as_deref(), job.options.connections)?;
+    let client = if cli.http_protocol == "auto" {
+        http::negotiated_download_client(cli.user_agent.as_deref(), job.options.connections)?
+    } else {
+        http::download_client(cli.user_agent.as_deref(), job.options.connections)?
+    };
     cheek::run(client, job, reporter).await?;
     Ok(())
 }

@@ -24,6 +24,8 @@ use tokio::sync::Semaphore;
 pub struct Options {
     /// Requests in flight across all streams of one download.
     pub connections: usize,
+    /// Adapt parallelism to measured throughput and server pressure.
+    pub adaptive: bool,
     /// Upper bound for one range request.
     pub chunk_size: u64,
 }
@@ -32,6 +34,7 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             connections: 8,
+            adaptive: true,
             chunk_size: 8 << 20,
         }
     }
@@ -51,7 +54,7 @@ pub struct Shared {
 /// Downloads one HTTP stream to `dest`.
 pub async fn fetch(shared: &Shared, stream: &Stream, dest: &Path) -> Result<u64> {
     let permit = shared.permits.acquire().await?;
-    let resp = probe(&shared.client, stream).await?;
+    let resp = probe(shared, stream).await?;
     if resp.status() == StatusCode::PARTIAL_CONTENT {
         let total = resp
             .headers()
@@ -73,17 +76,24 @@ pub async fn fetch(shared: &Shared, stream: &Stream, dest: &Path) -> Result<u64>
 }
 
 /// Size, and whether the server answers byte ranges.
-async fn probe(client: &Client, stream: &Stream) -> Result<Response> {
-    let resp = http::get(client, stream)
-        .header(header::RANGE, "bytes=0-0")
-        .send()
-        .await
-        .context("connecting")?;
-    let status = resp.status();
-    if !status.is_success() {
-        bail!("server said {status}");
+async fn probe(shared: &Shared, stream: &Stream) -> Result<Response> {
+    for attempt in 0..RETRIES {
+        let result = http::get(&shared.client, stream).header(header::RANGE, "bytes=0-0").send().await;
+        let delay = result.as_ref().ok().map(|r| http::retry_delay(Some(r.headers()), attempt + 1));
+        match result {
+            Ok(resp) if resp.status().is_success() => return Ok(resp),
+            Ok(resp)
+                if (resp.status().is_server_error()
+                    || matches!(resp.status(), StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT))
+                    && attempt + 1 < RETRIES => {}
+            Ok(resp) => bail!("server said {}", resp.status()),
+            Err(_) if attempt + 1 < RETRIES => {}
+            Err(e) => return Err(e.into()),
+        }
+        shared.progress.throttled();
+        tokio::time::sleep(delay.unwrap_or_else(|| http::retry_delay(None, attempt + 1))).await;
     }
-    Ok(resp)
+    unreachable!()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -206,18 +216,28 @@ async fn fetch_range(
 ) -> Result<()> {
     let want = end - start + 1;
     let mut attempt = 0;
+    let mut written = 0u64;
     loop {
-        let mut written = 0u64;
+        let mut retry_after = None;
         let result: Result<()> = async {
             let resp = http::get(client, stream)
-                .header(header::RANGE, format!("bytes={start}-{end}"))
+                .header(header::RANGE, format!("bytes={}-{end}", start + written))
                 .send()
                 .await?;
             let status = resp.status();
+            retry_after = Some(http::retry_delay(Some(resp.headers()), attempt + 1));
             if status != StatusCode::PARTIAL_CONTENT {
                 return Err(anyhow!(HttpStatus(status)));
             }
-            file.seek(std::io::SeekFrom::Start(start)).await?;
+            let expected = format!("bytes {}-{end}/", start + written);
+            anyhow::ensure!(
+                resp.headers()
+                    .get(header::CONTENT_RANGE)
+                    .and_then(|h| h.to_str().ok())
+                    .is_some_and(|r| r.starts_with(&expected)),
+                "server returned an incorrect Content-Range"
+            );
+            file.seek(std::io::SeekFrom::Start(start + written)).await?;
             let mut body = resp.bytes_stream();
             while let Some(piece) = body.next().await {
                 let piece = piece?;
@@ -238,15 +258,15 @@ async fn fetch_range(
         match result {
             Ok(()) => return Ok(()),
             Err(e) => {
-                progress.rewind(written);
+                progress.throttled();
                 attempt += 1;
                 let fatal = e
                     .downcast_ref::<HttpStatus>()
-                    .is_some_and(|s| s.0.is_client_error() && s.0 != StatusCode::TOO_MANY_REQUESTS);
+                    .is_some_and(|s| s.0.is_client_error() && s.0 != StatusCode::TOO_MANY_REQUESTS && s.0 != StatusCode::REQUEST_TIMEOUT);
                 if fatal || attempt >= RETRIES {
                     return Err(e);
                 }
-                tokio::time::sleep(Duration::from_millis(300 * 2u64.pow(attempt))).await;
+                tokio::time::sleep(retry_after.unwrap_or_else(|| http::retry_delay(None, attempt))).await;
             }
         }
     }

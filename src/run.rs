@@ -92,10 +92,15 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
 
     let shared = Shared {
         client,
-        permits: Arc::new(Semaphore::new(job.options.connections.max(1))),
+        permits: Arc::new(Semaphore::new(if job.options.adaptive {
+            job.options.connections.clamp(1, 2)
+        } else {
+            job.options.connections.clamp(1, 64)
+        })),
         progress: Arc::new(Progress::default()),
         options: job.options.clone(),
     };
+    let governor = crate::adaptive::watch(&shared);
     let started = Instant::now();
     let thumbnail = temp_dir.join(format!("cheek-cover-{}", std::process::id()));
     let fetch_cover = async {
@@ -121,6 +126,7 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
         }));
         tokio::join!(downloads, fetch_cover)
     };
+    drop(governor);
     if let Err(e) = downloaded {
         tokio::fs::remove_file(&thumbnail).await.ok();
         return Err(e);
@@ -150,7 +156,7 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
     // A plain name: ffmpeg reads `%` in output names as an image-sequence pattern.
     let merged = temp_dir.join(format!("cheek-merge-{}.{ext}", std::process::id()));
     let cover = match (&job.ffmpeg, got_cover) {
-        (Some(ffmpeg), Some(())) => ffmpeg.cover(&thumbnail).await.ok(),
+        (Some(ffmpeg), Some(())) => ffmpeg.cover_for(&thumbnail, &ext).await.ok(),
         _ => None,
     };
     let cover = cover.as_ref();

@@ -141,6 +141,30 @@ impl Ffmpeg {
         result
     }
 
+    pub async fn cover_for(&self, src: &Path, ext: &str) -> Result<Cover> {
+        if matches!(ext, "mp4" | "m4a" | "mov" | "mp3" | "flac") {
+            let head = tokio::fs::read(src).await?;
+            let mime = if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+                "image/jpeg"
+            } else if head.starts_with(&[0x89, b'P', b'N', b'G']) {
+                "image/png"
+            } else if (head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP"))
+                || head.starts_with(b"GIF8")
+                || head.starts_with(b"BM")
+            {
+                "image/unknown"
+            } else {
+                bail!("unsupported cover image");
+            };
+            Ok(Cover {
+                path: src.to_path_buf(),
+                mime,
+            })
+        } else {
+            self.cover(src).await
+        }
+    }
+
     /// The thumbnail at `src` as a picture every container takes: JPEG and PNG stay as they
     /// are, anything else (YouTube's WebP, for one) becomes a JPEG next to it.
     pub async fn cover(&self, src: &Path) -> Result<Cover> {
@@ -231,14 +255,16 @@ impl<'a> Art<'a> {
     fn outputs(&self, videos: usize) -> Vec<OsString> {
         match self {
             Art::None => Vec::new(),
-            Art::Stream { input, mp3, .. } => {
+            Art::Stream { input, mp3, cover } => {
                 let mut v: Vec<OsString> = vec![
                     "-map".into(),
                     format!("{input}:v:0").into(),
                     format!("-c:v:{videos}").into(),
-                    "copy".into(),
+                    if cover.mime == "image/unknown" { "mjpeg" } else { "copy" }.into(),
                     format!("-disposition:v:{videos}").into(),
                     "attached_pic".into(),
+                    format!("-frames:v:{videos}").into(),
+                    "1".into(),
                 ];
                 if *mp3 {
                     v.extend([
@@ -391,5 +417,61 @@ mod tests {
     #[test]
     fn ffmetadata_escapes() {
         assert_eq!(escape("a=b;c#d\\e"), "a\\=b\\;c\\#d\\\\e");
+    }
+}
+
+#[cfg(test)]
+mod cover_pipeline_tests {
+    use super::*;
+    #[tokio::test]
+    async fn webp_cover_is_converted_in_the_audio_pass() {
+        let Some(bin) = std::env::var_os("CHEEK_TEST_FFMPEG").map(PathBuf::from).or_else(|| which("ffmpeg")) else {
+            return;
+        };
+        let ffmpeg = Ffmpeg { bin };
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("audio.wav");
+        let image = dir.path().join("cover.webp");
+        ffmpeg
+            .run(&[
+                "-f".into(),
+                "lavfi".into(),
+                "-i".into(),
+                "sine=frequency=440:duration=0.2".into(),
+                audio.clone().into(),
+            ])
+            .await
+            .unwrap();
+        ffmpeg
+            .run(&[
+                "-f".into(),
+                "lavfi".into(),
+                "-i".into(),
+                "color=red:size=32x32".into(),
+                "-frames:v".into(),
+                "1".into(),
+                image.clone().into(),
+            ])
+            .await
+            .unwrap();
+        let cover = ffmpeg.cover_for(&image, "mp3").await.unwrap();
+        assert_eq!(cover.path, image);
+        assert!(!dir.path().join("cover.jpg").exists());
+        let media = Media {
+            id: "test".into(),
+            title: "test".into(),
+            extractor: "test".into(),
+            webpage_url: "https://example.com".into(),
+            thumbnail: None,
+            duration: None,
+            uploader: None,
+            streams: Vec::new(),
+        };
+        let output = dir.path().join("song.mp3");
+        ffmpeg
+            .audio(&audio, Some("pcm_s16le"), &output, &media, Some(&cover))
+            .await
+            .unwrap();
+        assert!(output.metadata().unwrap().len() > 0);
     }
 }

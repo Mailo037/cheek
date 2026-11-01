@@ -97,6 +97,7 @@ fn shared(connections: usize) -> Shared {
         options: Options {
             connections,
             chunk_size: 1 << 20,
+            ..Options::default()
         },
     }
 }
@@ -215,4 +216,44 @@ fn rand_suffix() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     static N: AtomicUsize = AtomicUsize::new(0);
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64 ^ (N.fetch_add(1, Ordering::SeqCst) as u64) << 48
+}
+
+#[tokio::test]
+async fn partial_retry_requests_the_remaining_suffix() {
+    use std::sync::Mutex;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/file", listener.local_addr().unwrap());
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let seen = starts.clone();
+    tokio::spawn(async move {
+        for n in 0..3 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            let text = String::from_utf8(request).unwrap().to_lowercase();
+            let range = text.lines().find_map(|l| l.strip_prefix("range: bytes=")).unwrap();
+            let (a, b) = range.trim().split_once('-').unwrap();
+            let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
+            seen.lock().unwrap().push(a);
+            let header = format!(
+                "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nContent-Length: {}\r\nContent-Range: bytes {a}-{b}/4096\r\n\r\n",
+                b - a + 1
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(&vec![42; if n == 1 { 1024 } else { b - a + 1 }]).await.unwrap();
+            if n == 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+        }
+    });
+    let dest = tempdir().join("partial.bin");
+    let s = shared(1);
+    fetch(&s, &stream(url), &dest).await.unwrap();
+    assert_eq!(std::fs::read(dest).unwrap(), vec![42; 4096]);
+    assert!(starts.lock().unwrap()[2] > 0, "retry must not restart the completed prefix");
+    assert_eq!(s.progress.snapshot().0, 4096);
 }

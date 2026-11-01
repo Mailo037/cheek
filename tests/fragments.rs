@@ -220,3 +220,61 @@ async fn interrupted_fragments_resume_where_they_stopped() {
     std::fs::remove_file(dest).unwrap();
     server.abort();
 }
+
+#[tokio::test]
+async fn slow_first_fragment_does_not_block_later_requests() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let ready = Arc::new(tokio::sync::Notify::new());
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let ready = ready.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    sock.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                }
+                let text = String::from_utf8(request).unwrap();
+                let i: usize = text.split_whitespace().nth(1).unwrap().trim_start_matches('/').parse().unwrap();
+                if i == 0 {
+                    ready.notified().await;
+                }
+                if i == 7 {
+                    ready.notify_one();
+                }
+                sock.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 1\r\n\r\n")
+                    .await
+                    .unwrap();
+                sock.write_all(&[i as u8]).await.unwrap();
+            });
+        }
+    });
+    let media = from_info_json(&serde_json::json!({
+        "url": format!("{base}/manifest"), "protocol": "http_dash_segments", "ext": "m4a",
+        "vcodec": "none", "acodec": "aac",
+        "fragments": (0..8).map(|i| serde_json::json!({"url": format!("{base}/{i}")})).collect::<Vec<_>>()
+    }))
+    .unwrap();
+    let shared = Shared {
+        client: cheek::http::download_client(None, 2).unwrap(),
+        permits: Arc::new(Semaphore::new(2)),
+        progress: Arc::new(Progress::default()),
+        options: Options {
+            connections: 2,
+            ..Options::default()
+        },
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("ordered");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        cheek::hls::fetch_parts(&shared, &media.streams[0], &dest, media.streams[0].fragments.clone()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(std::fs::read(dest).unwrap(), (0u8..8).collect::<Vec<_>>());
+}

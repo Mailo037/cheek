@@ -45,3 +45,53 @@ pub fn get(client: &Client, stream: &Stream) -> RequestBuilder {
     }
     req.header(header::ACCEPT, "*/*")
 }
+
+/// Negotiated HTTP/2 for A/B measurements; HTTP/1 remains the compatible default.
+pub fn negotiated_download_client(user_agent: Option<&str>, connections: usize) -> reqwest::Result<Client> {
+    builder(user_agent)
+        .pool_max_idle_per_host(connections.max(1) * 2)
+        .no_gzip()
+        .no_brotli()
+        .build()
+}
+
+/// Respect server cooldowns (seconds or HTTP date), with jitter to spread retries.
+pub fn retry_delay(headers: Option<&header::HeaderMap>, attempt: u32) -> Duration {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let server = headers
+        .and_then(|h| h.get(header::RETRY_AFTER))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.parse::<u64>().ok().map(Duration::from_secs).or_else(|| {
+                httpdate::parse_http_date(v)
+                    .ok()
+                    .map(|t| t.duration_since(std::time::SystemTime::now()).unwrap_or_default())
+            })
+        });
+    let salt = SEQUENCE.fetch_add(1, Ordering::Relaxed).wrapping_mul(6364136223846793005)
+        ^ std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64;
+    server
+        .unwrap_or_else(|| Duration::from_millis(300 * 2u64.pow(attempt.min(6))))
+        .saturating_add(Duration::from_millis(salt % 300))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn retry_after_seconds_and_dates_are_minimum_delays() {
+        let mut h = header::HeaderMap::new();
+        h.insert(header::RETRY_AFTER, "7".parse().unwrap());
+        assert!(retry_delay(Some(&h), 1) >= Duration::from_secs(7));
+        let date = httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(30));
+        h.insert(header::RETRY_AFTER, date.parse().unwrap());
+        assert!(retry_delay(Some(&h), 1) >= Duration::from_secs(28));
+        h.insert(header::RETRY_AFTER, "invalid".parse().unwrap());
+        let d = retry_delay(Some(&h), 2);
+        assert!((Duration::from_millis(1200)..Duration::from_millis(1500)).contains(&d));
+    }
+}

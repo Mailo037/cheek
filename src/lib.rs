@@ -18,3 +18,5 @@ pub mod template;
 
 pub use media::{Media, Protocol, Stream, StreamKind};
 pub use run::{Job, run};
+
+mod adaptive;

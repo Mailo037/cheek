@@ -187,48 +187,62 @@ pub async fn fetch_parts(shared: &Shared, stream: &Stream, dest: &Path, parts: V
         progress.set_total_at_least(kept * count as u64 / skip as u64);
     }
 
-    // Segments land in memory and are written in order as soon as the next one is there.
+    // Completed segments spill to disk, so a slow early segment cannot stall the
+    // network window or accumulate entire segments in memory.
+    let staging = tempfile::tempdir_in(dest.parent().unwrap_or_else(|| Path::new(".")))?;
     let fetched = Arc::new(AtomicU64::new(kept));
     let finished = Arc::new(AtomicUsize::new(skip));
-    // Each request needs headers, not another copy of the entire fragment list.
     let mut source = stream.clone();
     source.fragments.clear();
     let results = futures_util::stream::iter(parts.into_iter().enumerate().skip(skip).map(|(i, url)| {
         let (client, permits, stream) = (shared.client.clone(), shared.permits.clone(), source.clone());
         let (fetched, finished, progress) = (fetched.clone(), finished.clone(), progress.clone());
+        let path = staging.path().join(i.to_string());
         async move {
-            let _p = permits.acquire().await?;
             let mut s = stream;
             s.url = url;
             let mut attempt = 0;
             let bytes = loop {
-                match async { anyhow::Ok(http::get(&client, &s).send().await?.error_for_status()?.bytes().await?) }.await {
-                    Ok(b) => break b,
-                    Err(e)
-                        if e.downcast_ref::<reqwest::Error>().and_then(|e| e.status()).is_some_and(|status| {
-                            status.is_client_error()
-                                && status != reqwest::StatusCode::TOO_MANY_REQUESTS
-                                && status != reqwest::StatusCode::REQUEST_TIMEOUT
-                        }) =>
-                    {
-                        return Err(e.context(format!("segment {}", i + 1)));
+                let mut delay = None;
+                let result: Result<u64> = async {
+                    let _p = permits.acquire().await?;
+                    let response = http::get(&client, &s).send().await?;
+                    delay = Some(http::retry_delay(Some(response.headers()), attempt + 1));
+                    let mut body = response.error_for_status()?.bytes_stream();
+                    let mut file = BufWriter::with_capacity(256 << 10, tokio::fs::File::create(&path).await?);
+                    let mut bytes = 0;
+                    while let Some(piece) = body.next().await {
+                        let piece = piece?;
+                        file.write_all(&piece).await?;
+                        bytes += piece.len() as u64;
                     }
-                    Err(e) if attempt >= 4 => return Err(e.context(format!("segment {}", i + 1))),
-                    Err(_) => {
+                    file.flush().await?;
+                    Ok(bytes)
+                }
+                .await;
+                match result {
+                    Ok(b) => break b,
+                    Err(e) => {
+                        let fatal = e.downcast_ref::<reqwest::Error>().and_then(|e| e.status()).is_some_and(|s| {
+                            s.is_client_error() && s != reqwest::StatusCode::TOO_MANY_REQUESTS && s != reqwest::StatusCode::REQUEST_TIMEOUT
+                        });
+                        if fatal || attempt >= 4 {
+                            return Err(e.context(format!("segment {}", i + 1)));
+                        }
+                        progress.throttled();
                         attempt += 1;
-                        tokio::time::sleep(std::time::Duration::from_millis(400 * attempt)).await;
+                        tokio::time::sleep(delay.unwrap_or_else(|| http::retry_delay(None, attempt))).await;
                     }
                 }
             };
-            let total = fetched.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
+            let total = fetched.fetch_add(bytes, Ordering::Relaxed) + bytes;
             let n = finished.fetch_add(1, Ordering::Relaxed) as u64 + 1;
-            // The real size is only known at the end; extrapolate from what came so far.
             progress.set_total_at_least(total * count as u64 / n);
-            progress.add(bytes.len() as u64);
-            anyhow::Ok(bytes)
+            progress.add(bytes);
+            anyhow::Ok((i, path, bytes))
         }
     }))
-    .buffered(shared.options.connections.clamp(1, 64) * 2);
+    .buffer_unordered(shared.options.connections.clamp(1, 64) * 2);
 
     let file = tokio::fs::OpenOptions::new()
         .create(true)
@@ -249,12 +263,19 @@ pub async fn fetch_parts(shared: &Shared, stream: &Stream, dest: &Path, parts: V
     };
     let mut noted = Instant::now();
     let mut results = std::pin::pin!(results);
+    let mut pending = std::collections::BTreeMap::new();
     let outcome: Result<()> = async {
         while let Some(piece) = results.next().await {
-            let piece = piece?;
-            out.write_all(&piece).await?;
-            notes.written += 1;
-            notes.bytes += piece.len() as u64;
+            let (index, path, bytes) = piece?;
+            pending.insert(index, (path, bytes));
+            while let Some((path, bytes)) = pending.remove(&notes.written) {
+                let mut input = tokio::fs::File::open(&path).await?;
+                tokio::io::copy(&mut input, &mut out).await?;
+                drop(input);
+                tokio::fs::remove_file(path).await?;
+                notes.written += 1;
+                notes.bytes += bytes;
+            }
             // The bytes must be on disk before the note that counts them; at most once a second.
             if noted.elapsed() > Duration::from_secs(1) {
                 noted = Instant::now();
