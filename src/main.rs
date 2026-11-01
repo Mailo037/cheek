@@ -144,12 +144,19 @@ async fn main() -> ExitCode {
 }
 
 async fn go(cli: Cli, reporter: &Reporter) -> Result<()> {
+    let resolving = std::time::Instant::now();
     let opts = ResolveOptions {
         resolver: cli.resolver,
         yt_dlp: cli.yt_dlp.clone(),
         format: cli.format.clone().unwrap_or_else(|| "bv*+ba/b".into()),
     };
-    let client = http::page_client(cli.user_agent.as_deref())?;
+    // Reuse the configured connection pool from resolution through all playlist downloads.
+    let connections = cli.connections.clamp(1, if cli.power_save { 2 } else { 64 });
+    let client = if cli.http_protocol == "auto" {
+        http::negotiated_download_client(cli.user_agent.as_deref(), connections)?
+    } else {
+        http::download_client(cli.user_agent.as_deref(), connections)?
+    };
     let resolved = match (&cli.info_json, &cli.url) {
         (Some(path), _) => {
             let text = if path.as_os_str() == "-" {
@@ -180,15 +187,32 @@ async fn go(cli: Cli, reporter: &Reporter) -> Result<()> {
         return Ok(());
     }
 
+    reporter.emit(&Event::Timing {
+        phase: "resolve",
+        seconds: resolving.elapsed().as_secs_f64(),
+    });
     match resolved {
-        Resolved::Media(media) => download(&cli, media, reporter).await,
+        Resolved::Media(media) => download(&cli, &client, media, reporter).await,
         Resolved::Playlist(playlist) => {
             anyhow::ensure!(!playlist.entries.is_empty(), "playlist contains no songs");
             let mut failed = 0;
             for entry in playlist.entries {
                 let result = async {
-                    let media = extract::resolve(&client, &entry.url, &opts).await?;
-                    download(&cli, media, reporter).await
+                    let started = std::time::Instant::now();
+                    let cached = if opts.resolver != Resolver::YtDlp {
+                        extract::glyph::extract_entry(&client, &entry).await?
+                    } else {
+                        None
+                    };
+                    let media = match cached {
+                        Some(m) => m,
+                        None => extract::resolve(&client, &entry.url, &opts).await?,
+                    };
+                    reporter.emit(&Event::Timing {
+                        phase: "resolve_entry",
+                        seconds: started.elapsed().as_secs_f64(),
+                    });
+                    download(&cli, &client, media, reporter).await
                 }
                 .await;
                 if let Err(error) = result {
@@ -204,7 +228,7 @@ async fn go(cli: Cli, reporter: &Reporter) -> Result<()> {
     }
 }
 
-async fn download(cli: &Cli, media: Media, reporter: &Reporter) -> Result<()> {
+async fn download(cli: &Cli, client: &reqwest::Client, media: Media, reporter: &Reporter) -> Result<()> {
     let job = Job {
         media,
         out_dir: cli.paths.clone(),
@@ -222,11 +246,6 @@ async fn download(cli: &Cli, media: Media, reporter: &Reporter) -> Result<()> {
         embed_thumbnail: cli.embed_thumbnail,
         embed_metadata: cli.embed_metadata,
     };
-    let client = if cli.http_protocol == "auto" {
-        http::negotiated_download_client(cli.user_agent.as_deref(), job.options.connections)?
-    } else {
-        http::download_client(cli.user_agent.as_deref(), job.options.connections)?
-    };
-    cheek::run(client, job, reporter).await?;
+    cheek::run(client.clone(), job, reporter).await?;
     Ok(())
 }

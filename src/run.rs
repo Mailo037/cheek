@@ -105,9 +105,15 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
     let thumbnail = temp_dir.join(format!("cheek-cover-{}", std::process::id()));
     let fetch_cover = async {
         let url = media.thumbnail.as_deref().filter(|_| job.embed_thumbnail && job.ffmpeg.is_some())?;
+        let cover_started = Instant::now();
         // A missing cover is no reason to fail the download.
         let get = async { anyhow::Ok(shared.client.get(url).send().await?.error_for_status()?.bytes().await?) };
-        let bytes = tokio::time::timeout(std::time::Duration::from_secs(20), get).await.ok()?.ok()?;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), get).await;
+        reporter.emit(&Event::Timing {
+            phase: "cover",
+            seconds: cover_started.elapsed().as_secs_f64(),
+        });
+        let bytes = result.ok()?.ok()?;
         tokio::fs::write(&thumbnail, &bytes).await.ok()?;
         Some(())
     };
@@ -124,9 +130,19 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
                 .with_context(|| format!("downloading {}", s.format_id.as_deref().unwrap_or("the stream")))
             }
         }));
-        tokio::join!(downloads, fetch_cover)
+        let timed_downloads = async {
+            let start = Instant::now();
+            let result = downloads.await;
+            reporter.emit(&Event::Timing {
+                phase: "download",
+                seconds: start.elapsed().as_secs_f64(),
+            });
+            result
+        };
+        tokio::join!(timed_downloads, fetch_cover)
     };
     drop(governor);
+    let post_started = Instant::now();
     if let Err(e) = downloaded {
         tokio::fs::remove_file(&thumbnail).await.ok();
         return Err(e);
@@ -212,6 +228,10 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
         }
     }
 
+    reporter.emit(&Event::Timing {
+        phase: "postprocess",
+        seconds: post_started.elapsed().as_secs_f64(),
+    });
     let bytes = tokio::fs::metadata(&final_path).await.map(|m| m.len()).unwrap_or(0);
     let path = final_path.to_string_lossy();
     reporter.emit(&Event::Done {

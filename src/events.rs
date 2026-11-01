@@ -56,6 +56,10 @@ pub enum Event<'a> {
         speed: u64,
         eta: Option<u64>,
     },
+    Timing {
+        phase: &'a str,
+        seconds: f64,
+    },
     Stage {
         stage: &'a str,
     },
@@ -128,6 +132,7 @@ impl Reporter {
                     bar.set_position(*downloaded);
                 }
             }
+            Event::Timing { .. } => {}
             Event::Stage { stage } => {
                 if let Some(bar) = &self.bar {
                     bar.suspend(|| eprintln!("[cheek] {stage}"));

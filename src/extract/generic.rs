@@ -3,8 +3,9 @@
 
 use crate::media::{Media, Protocol, Stream, StreamKind, ext_for_mime, is_audio_ext, is_media_ext};
 use anyhow::{Context, Result, anyhow};
+use futures_util::StreamExt;
 use regex::Regex;
-use reqwest::{Client, Response, header};
+use reqwest::{Client, Response, StatusCode, header};
 use std::sync::LazyLock;
 use url::Url;
 
@@ -32,28 +33,43 @@ pub async fn extract(client: &Client, url: &str) -> Result<Media> {
     let mime = content_type(&resp);
 
     if let Some(stream) = media_stream(&final_url, &mime, &resp) {
+        // Finish tiny ranged responses so the same connection can serve the download.
+        if resp.content_length().is_some_and(|n| n <= 4096) {
+            resp.bytes().await?;
+        }
         return Ok(single(&final_url, url, stream));
     }
     if !mime.contains("html") {
         return Err(anyhow!(Unsupported));
     }
     // The ranged probe returned at most one byte of the page; fetch it whole.
-    let page = client.get(final_url.as_str()).send().await?.error_for_status()?;
+    let page = if resp.status() == StatusCode::PARTIAL_CONTENT {
+        client.get(final_url.as_str()).send().await?.error_for_status()?
+    } else {
+        resp
+    };
     let page_url = page.url().clone();
     let html = page.text().await?;
     let found = Page::parse(&html, &page_url);
 
-    for candidate in &found.media {
-        let Ok(u) = Url::parse(candidate) else { continue };
-        let Ok(r) = client.get(u.as_str()).header(header::RANGE, "bytes=0-0").send().await else {
-            continue;
-        };
+    // Probe a small window concurrently, but preserve the extractor's candidate order.
+    let candidates = futures_util::stream::iter(found.media.iter().map(|candidate| async move {
+        let u = Url::parse(candidate).ok()?;
+        let r = client.get(u.as_str()).header(header::RANGE, "bytes=0-0").send().await.ok()?;
         if !r.status().is_success() {
-            continue;
+            return None;
         }
-        let m = content_type(&r);
-        if let Some(stream) = media_stream(r.url(), &m, &r) {
-            let mut media = single(r.url(), url, stream);
+        let stream = media_stream(r.url(), &content_type(&r), &r)?;
+        let media = single(r.url(), url, stream);
+        if r.content_length().is_some_and(|n| n <= 4096) {
+            r.bytes().await.ok()?;
+        }
+        Some(media)
+    }))
+    .buffered(3);
+    let mut candidates = std::pin::pin!(candidates);
+    while let Some(candidate) = candidates.next().await {
+        if let Some(mut media) = candidate {
             if let Some(t) = &found.title {
                 media.title = t.clone();
             }

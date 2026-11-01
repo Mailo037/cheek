@@ -175,6 +175,30 @@ struct Source {
     preview: bool,
 }
 
+/// Entries already carry song metadata from their playlist page; don't load it again.
+pub async fn extract_entry(client: &Client, entry: &PlaylistEntry) -> Result<Option<Media>> {
+    let Some(target) = Target::parse(&entry.url)? else {
+        return Ok(None);
+    };
+    let Some(index) = target.index else {
+        return Ok(None);
+    };
+    extract_playlist_song(client, &target.page(), index, entry).await.map(Some)
+}
+
+async fn extract_playlist_song(client: &Client, page: &str, index: usize, entry: &PlaylistEntry) -> Result<Media> {
+    extract_song(
+        client,
+        page,
+        Song {
+            index,
+            title: entry.title.clone(),
+            artist: entry.uploader.clone(),
+        },
+    )
+    .await
+}
+
 pub async fn extract(client: &Client, target: &Target) -> Result<Media> {
     let page = target.page();
     extract_page(client, &page, target.index).await
@@ -271,6 +295,47 @@ mod tests {
         assert_eq!(media.streams[0].size, Some(12345));
         assert_eq!(media.streams[0].format_id.as_deref(), Some("glyph-preview"));
         assert_eq!(media.streams[0].url, page.replace("/p/UrPYWeQ4", "/audio"));
+    }
+
+    #[tokio::test]
+    async fn playlist_entry_does_not_fetch_the_html_page_again() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let page = format!("http://{}/p/UrPYWeQ4", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for path in ["/p/UrPYWeQ4/listen/2?json=1", "/audio.mp3"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                }
+                assert!(String::from_utf8(request).unwrap().starts_with(&format!("GET {path} HTTP/1.1")));
+                let (mime, body) = if path.ends_with("json=1") {
+                    ("application/json", r#"{"url":"/audio.mp3","preview":false}"#)
+                } else {
+                    ("audio/mpeg", "a")
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let entry = PlaylistEntry {
+            id: "song".into(),
+            title: "Cached song".into(),
+            uploader: "Cached artist".into(),
+            url: "https://glyph.my/p/UrPYWeQ4/listen/2".into(),
+            thumbnail: String::new(),
+            extractor_key: "Glyph".into(),
+        };
+        let media = extract_playlist_song(&Client::new(), &page, 2, &entry).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(media.title, "Cached song");
+        assert_eq!(media.uploader.as_deref(), Some("Cached artist"));
     }
 
     #[test]

@@ -28,18 +28,26 @@ class Fixture(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path.startswith("/segment/"):
+        is_page = self.path == "/page"
+        if self.path in ("/page", "/resolved-song.mp3"):
+            time.sleep(0.08)  # Controlled request latency makes redundant resolution visible.
+        if is_page:
+            body = b'<title>Resolved song</title><meta property="og:audio" content="/resolved-song.mp3">'
+        elif self.path == "/resolved-song.mp3":
+            body = DATA[:4 * 1024 * 1024]
+        elif self.path.startswith("/segment/"):
             i = int(self.path.rsplit("/", 1)[1])
             time.sleep(0.6 if i == 0 else 0.025)
             body = bytes([i]) * len(BLOCK)
         else:
             body = DATA
         start, end = 0, len(body) - 1
-        ranged = self.headers.get("Range")
+        ranged = None if is_page else self.headers.get("Range")
         if ranged:
             start, end = map(int, ranged.removeprefix("bytes=").split("-"))
             end = min(end, len(body) - 1)
         self.send_response(206 if ranged else 200)
+        self.send_header("Content-Type", "text/html" if is_page else "audio/mpeg")
         if ranged:
             self.send_header("Content-Range", f"bytes {start}-{end}/{len(body)}")
         self.send_header("Content-Length", str(end - start + 1))
@@ -53,7 +61,7 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             pass
 
 
-def measure(binary, flags, fixture, url, extra, folder):
+def measure(binary, flags, fixture, url, extra, folder, expected=None):
     args = [str(binary), "--json", "-P", str(folder), "-o", "result.%(ext)s"]
     args += (["--", url] if url else ["--info-json", str(fixture)])
     # Options must precede the positional -- terminator.
@@ -97,9 +105,10 @@ def measure(binary, flags, fixture, url, extra, folder):
     post = next((t for t, e in events if e.get("type") == "stage"), None)
     files = list(folder.glob("result.*"))
     exact = None
-    if not url:
-        exact = len(files) == 1 and hashlib.sha256(files[0].read_bytes()).digest() == hashlib.sha256(DATA).digest()
+    if expected is not None:
+        exact = len(files) == 1 and hashlib.sha256(files[0].read_bytes()).digest() == hashlib.sha256(expected).digest()
     return dict(exit=proc.returncode, seconds=elapsed, resolve_seconds=info,
+                phase_seconds={e["phase"]: e["seconds"] for _, e in events if e.get("type") == "timing"},
                 transfer_seconds=(post or elapsed) - (info or 0),
                 postprocess_seconds=elapsed - post if post else 0,
                 cpu_seconds_sampled=cpu if psutil else None,
@@ -112,6 +121,7 @@ def main():
     ap.add_argument("--baseline", type=Path)
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--url")
+    ap.add_argument("--resolve-fixture", action="store_true", help="resolve an HTML page pointing to a 4 MiB file with controlled request latency")
     ap.add_argument("--extra-arg", action="append", default=[])
     ap.add_argument("--report", type=Path, default=Path("benchmark-results.json"))
     opt = ap.parse_args()
@@ -126,7 +136,7 @@ def main():
     report = []
     try:
         with tempfile.TemporaryDirectory(prefix="cheek-bench-") as tmp:
-            for scenario in (["remote"] if opt.url else ["ranges", "fragments"]):
+            for scenario in (["resolve"] if opt.resolve_fixture else ["remote"] if opt.url else ["ranges", "fragments"]):
                 stream = dict(url=base + "/file", ext="bin", kind="muxed", protocol="http")
                 if scenario == "fragments":
                     stream.update(protocol="fragments", fragments=[base + f"/segment/{i}" for i in range(24)])
@@ -138,7 +148,8 @@ def main():
                         folder = Path(tmp) / f"{scenario}-{mode}-{run}"
                         folder.mkdir()
                         result = measure((opt.baseline if mode == "baseline" else opt.binary).resolve(),
-                                         flags, fixture, opt.url, opt.extra_arg, folder)
+                                         flags, fixture, base + "/page" if scenario == "resolve" else opt.url, opt.extra_arg, folder,
+                                         expected=DATA[:4 * 1024 * 1024] if scenario == "resolve" else DATA if not opt.url else None)
                         result.update(scenario=scenario, mode=mode, run=run)
                         report.append(result)
                         print(json.dumps(result), flush=True)

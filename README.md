@@ -198,6 +198,26 @@ CPU samples are approximate and can miss short-lived children. Android energy
 requires separate `adb shell dumpsys batterystats` measurements under equal network,
 screen and charging conditions; desktop timings do not establish battery savings.
 
+## Resolution latency
+
+Cheek reuses complete HTML responses and its HTTP connection pool through resolution
+and downloads. Media candidates are probed with a window of three while preserving
+priority. Glyph playlist entries reuse their existing title/artist instead of fetching
+the playlist HTML for each song. `-J` still prints only the resolved JSON.
+
+With `--json`, `timing` events distinguish `resolve`, `resolve_entry`, `download`,
+`cover` (including a timed-out cover request) and `postprocess`. Cover loading overlaps
+the transfer, so their durations must not simply be summed. A slow media source or
+an external yt-dlp extraction can still dominate small downloads.
+
+```sh
+python tools/benchmark.py --binary target/release/cheek --baseline /path/to/old-cheek --resolve-fixture --runs 3
+```
+
+This fixture serves an HTML page pointing to a 4 MiB file with controlled request
+latency. Compare equivalent build profiles; this is not a measurement of a real
+provider's response times.
+
 ## License
 
 [Unlicense](LICENSE), public domain, like yt-dlp.
