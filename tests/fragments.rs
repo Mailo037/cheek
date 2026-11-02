@@ -92,6 +92,8 @@ async fn parallel_fragments_preserve_order_and_retry() {
             ffmpeg: None,
             embed_thumbnail: false,
             embed_metadata: false,
+            subtitles: Vec::new(),
+            playlist_title: None,
             options: Options {
                 connections: 3,
                 ..Options::default()

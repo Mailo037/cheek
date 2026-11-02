@@ -96,6 +96,18 @@ struct Cli {
     #[arg(long)]
     embed_metadata: bool,
 
+    /// Write the site's subtitles into the file (mp4, mkv, webm; needs ffmpeg).
+    #[arg(long)]
+    embed_subs: bool,
+
+    /// Subtitle languages for --embed-subs, comma-separated (`en,de`; yt-dlp's `en.*` works too; `all`).
+    #[arg(long, value_name = "LANGS", default_value = "en")]
+    sub_langs: String,
+
+    /// Seconds yt-dlp may take to resolve one link.
+    #[arg(long, value_name = "SECS", default_value_t = 180)]
+    resolve_timeout: u64,
+
     /// Machine-readable events on stdout, one JSON object per line.
     #[arg(long)]
     json: bool,
@@ -149,6 +161,7 @@ async fn go(cli: Cli, reporter: &Reporter) -> Result<()> {
         resolver: cli.resolver,
         yt_dlp: cli.yt_dlp.clone(),
         format: cli.format.clone().unwrap_or_else(|| "bv*+ba/b".into()),
+        timeout: std::time::Duration::from_secs(cli.resolve_timeout.max(1)),
     };
     // Reuse the configured connection pool from resolution through all playlist downloads.
     let connections = cli.connections.clamp(1, if cli.power_save { 2 } else { 64 });
@@ -167,9 +180,9 @@ async fn go(cli: Cli, reporter: &Reporter) -> Result<()> {
                 std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
             };
             let value: serde_json::Value = serde_json::from_str(&text).context("the info JSON isn't valid JSON")?;
-            // Either yt-dlp's info dict or cheek's own -J output.
+            // Either yt-dlp's info dict (a flat playlist too) or cheek's own -J output.
             if value.get("_type").and_then(serde_json::Value::as_str) == Some("playlist") {
-                Resolved::Playlist(serde_json::from_value(value)?)
+                Resolved::Playlist(extract::glyph::Playlist::from_info(&value)?)
             } else if value.get("streams").is_some() {
                 Resolved::Media(serde_json::from_value(value)?)
             } else if let Some(spec) = &cli.format {
@@ -192,15 +205,15 @@ async fn go(cli: Cli, reporter: &Reporter) -> Result<()> {
         seconds: resolving.elapsed().as_secs_f64(),
     });
     match resolved {
-        Resolved::Media(media) => download(&cli, &client, media, reporter).await,
+        Resolved::Media(media) => download(&cli, &client, media, None, reporter).await,
         Resolved::Playlist(playlist) => {
             anyhow::ensure!(!playlist.entries.is_empty(), "playlist contains no songs");
             let mut failed = 0;
-            for entry in playlist.entries {
+            for entry in &playlist.entries {
                 let result = async {
                     let started = std::time::Instant::now();
                     let cached = if opts.resolver != Resolver::YtDlp {
-                        extract::glyph::extract_entry(&client, &entry).await?
+                        extract::glyph::extract_entry(&client, entry).await?
                     } else {
                         None
                     };
@@ -212,7 +225,8 @@ async fn go(cli: Cli, reporter: &Reporter) -> Result<()> {
                         phase: "resolve_entry",
                         seconds: started.elapsed().as_secs_f64(),
                     });
-                    download(&cli, &client, media, reporter).await
+                    let playlist_title = Some(playlist.title.clone()).filter(|t| !t.is_empty());
+                    download(&cli, &client, media, playlist_title, reporter).await
                 }
                 .await;
                 if let Err(error) = result {
@@ -228,7 +242,7 @@ async fn go(cli: Cli, reporter: &Reporter) -> Result<()> {
     }
 }
 
-async fn download(cli: &Cli, client: &reqwest::Client, media: Media, reporter: &Reporter) -> Result<()> {
+async fn download(cli: &Cli, client: &reqwest::Client, media: Media, playlist_title: Option<String>, reporter: &Reporter) -> Result<()> {
     let job = Job {
         media,
         out_dir: cli.paths.clone(),
@@ -245,6 +259,17 @@ async fn download(cli: &Cli, client: &reqwest::Client, media: Media, reporter: &
         },
         embed_thumbnail: cli.embed_thumbnail,
         embed_metadata: cli.embed_metadata,
+        subtitles: if cli.embed_subs {
+            cli.sub_langs
+                .split(',')
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        } else {
+            Vec::new()
+        },
+        playlist_title,
     };
     cheek::run(client.clone(), job, reporter).await?;
     Ok(())

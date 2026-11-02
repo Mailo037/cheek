@@ -43,6 +43,8 @@ pub struct ResolveOptions {
     pub yt_dlp: Option<PathBuf>,
     /// yt-dlp format selector, used when yt-dlp resolves.
     pub format: String,
+    /// How long yt-dlp may take to resolve one link.
+    pub timeout: std::time::Duration,
 }
 
 /// Sites that only make sense through yt-dlp's extractors.
@@ -103,7 +105,7 @@ pub async fn resolve(client: &Client, url: &str, opts: &ResolveOptions) -> Resul
     match opts.resolver {
         Resolver::Native => generic::extract(client, url).await,
         Resolver::YtDlp => match yt_dlp() {
-            Some(bin) => ytdlp::resolve(&bin, url, &opts.format).await,
+            Some(bin) => ytdlp::resolve(&bin, url, &opts.format, opts.timeout).await,
             None => bail!("yt-dlp isn't installed; get it from https://github.com/yt-dlp/yt-dlp or pass --yt-dlp"),
         },
         Resolver::Auto => {
@@ -115,7 +117,7 @@ pub async fn resolve(client: &Client, url: &str, opts: &ResolveOptions) -> Resul
                 }
             }
             match yt_dlp() {
-                Some(bin) => ytdlp::resolve(&bin, url, &opts.format).await,
+                Some(bin) => ytdlp::resolve(&bin, url, &opts.format, opts.timeout).await,
                 None => bail!("cheek can't read this site by itself and yt-dlp isn't installed (https://github.com/yt-dlp/yt-dlp)"),
             }
         }

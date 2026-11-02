@@ -4,10 +4,11 @@ use crate::download::{self, Options, Shared};
 use crate::events::{Event, Progress, Reporter};
 use crate::hls;
 use crate::media::{Media, Protocol, Stream, StreamKind, is_audio_ext};
-use crate::merge::{Ffmpeg, audio_ext_for, taggable};
+use crate::merge::{Ffmpeg, SubFile, audio_ext_for, subtitle_codec, taggable};
 use crate::template;
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -29,6 +30,10 @@ pub struct Job {
     pub embed_thumbnail: bool,
     /// Write title, artist and link even into files that needed no other ffmpeg step.
     pub embed_metadata: bool,
+    /// Subtitle languages to write into the file (`en`, `de`, `all`); empty for none.
+    pub subtitles: Vec<String>,
+    /// The playlist this file is part of, for the done event.
+    pub playlist_title: Option<String>,
 }
 
 pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBuf> {
@@ -53,17 +58,24 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
 
     let ext = final_ext(&job, &streams);
     let final_path = job.out_dir.join(template::render(&job.template, media, &ext));
+    let done = |bytes: u64, seconds: f64| {
+        let path = final_path.to_string_lossy();
+        reporter.emit(&Event::Done {
+            path: &path,
+            bytes,
+            seconds,
+            title: Some(&media.title),
+            thumbnail: media.thumbnail.as_deref(),
+            duration: media.duration,
+            playlist_title: job.playlist_title.as_deref(),
+        });
+    };
     // An empty leftover from a failed run doesn't count as done.
     if final_path.metadata().is_ok_and(|m| m.len() > 0) {
         reporter.emit(&Event::Stage {
             stage: "already downloaded",
         });
-        let path = final_path.to_string_lossy();
-        reporter.emit(&Event::Done {
-            path: &path,
-            bytes: std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0),
-            seconds: 0.0,
-        });
+        done(std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0), 0.0);
         return Ok(final_path);
     }
     if let Some(dir) = final_path.parent() {
@@ -89,6 +101,8 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
             temp_dir.join(format!("{stem}.f{id}.{ext}.part"))
         })
         .collect();
+    // A stream loses its `.part` once all of it is in; that file is kept until the result is.
+    let files: Vec<PathBuf> = parts.iter().map(|p| p.with_extension("")).collect();
 
     let shared = Shared {
         client,
@@ -117,17 +131,54 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
         tokio::fs::write(&thumbnail, &bytes).await.ok()?;
         Some(())
     };
-    let (downloaded, got_cover) = {
+    // Subtitles go in where the container keeps them and ffmpeg is there to write them.
+    let sub_files = async {
+        let wanted: Vec<_> = if job.audio.is_none() && job.ffmpeg.is_some() && subtitle_codec(&ext).is_some() {
+            media
+                .subtitles
+                .iter()
+                .filter(|s| job.subtitles.iter().any(|w| s.matches(w)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut out = Vec::new();
+        for (i, sub) in wanted.into_iter().enumerate() {
+            let path = temp_dir.join(format!("cheek-sub-{}-{i}.{}", std::process::id(), sub.ext));
+            let get = async { anyhow::Ok(shared.client.get(&sub.url).send().await?.error_for_status()?.bytes().await?) };
+            // Like the cover: a subtitle that won't come is no reason to fail the download.
+            if let Ok(Ok(bytes)) = tokio::time::timeout(std::time::Duration::from_secs(20), get).await
+                && tokio::fs::write(&path, &bytes).await.is_ok()
+            {
+                out.push(SubFile {
+                    path,
+                    lang: sub.lang.clone(),
+                });
+            }
+        }
+        out
+    };
+    let (downloaded, got_cover, subs) = {
         let _watch = reporter.watch(shared.progress.clone());
-        let downloads = futures_util::future::try_join_all(streams.iter().zip(&parts).map(|(s, p)| {
+        let downloads = futures_util::future::try_join_all(streams.iter().zip(&parts).zip(&files).map(|((s, p), f)| {
             let shared = &shared;
             async move {
-                match s.protocol {
+                // Already complete from an earlier run whose merge failed: no need to fetch it again.
+                if let Ok(m) = tokio::fs::metadata(f).await
+                    && m.len() > 0
+                {
+                    shared.progress.add_total(m.len());
+                    shared.progress.add(m.len());
+                    return anyhow::Ok(m.len());
+                }
+                let size = match s.protocol {
                     Protocol::Http => download::fetch(shared, s, p).await,
                     Protocol::Hls => hls::fetch(shared, s, p, job.max_height).await,
                     Protocol::Fragments => hls::fetch_parts(shared, s, p, s.fragments.clone()).await,
                 }
-                .with_context(|| format!("downloading {}", s.format_id.as_deref().unwrap_or("the stream")))
+                .with_context(|| format!("downloading {}", s.format_id.as_deref().unwrap_or("the stream")))?;
+                tokio::fs::rename(p, f).await?;
+                anyhow::Ok(size)
             }
         }));
         let timed_downloads = async {
@@ -139,27 +190,24 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
             });
             result
         };
-        tokio::join!(timed_downloads, fetch_cover)
+        tokio::join!(timed_downloads, fetch_cover, sub_files)
     };
     drop(governor);
     let post_started = Instant::now();
+    let covers = [thumbnail.clone(), thumbnail.with_extension("jpg")];
+    let extras = || covers.iter().chain(subs.iter().map(|s| &s.path));
     if let Err(e) = downloaded {
-        tokio::fs::remove_file(&thumbnail).await.ok();
+        remove_all(extras()).await;
         return Err(e);
     }
-    let (done, _) = shared.progress.snapshot();
+    let (fetched, _) = shared.progress.snapshot();
     reporter.emit(&Event::Progress {
-        downloaded: done,
-        total: done,
+        downloaded: fetched,
+        total: fetched,
         percent: 100.0,
         speed: 0,
         eta: Some(0),
     });
-
-    let files: Vec<PathBuf> = parts.iter().map(|p| p.with_extension("")).collect();
-    for (part, file) in parts.iter().zip(&files) {
-        tokio::fs::rename(part, file).await?;
-    }
 
     let need_ffmpeg = |why: &str| -> Result<&Ffmpeg> {
         job.ffmpeg
@@ -176,53 +224,82 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
         _ => None,
     };
     let cover = cover.as_ref();
-    // Files that need no other ffmpeg step still get their tags and cover when asked to.
-    let retag = |video: bool| {
-        let ffmpeg = job
-            .ffmpeg
-            .as_ref()
-            .filter(|_| (job.embed_metadata || cover.is_some()) && taggable(&ext));
-        let (files, merged, final_path) = (&files, &merged, &final_path);
-        async move {
-            match ffmpeg {
-                Some(ffmpeg) => {
-                    reporter.emit(&Event::Stage { stage: "tagging" });
-                    ffmpeg.tag(&files[0], merged, media, video, cover).await?;
-                    move_file(merged, final_path).await
-                }
-                None => move_file(&files[0], final_path).await,
-            }
+    // How far ffmpeg is, as a share of the media's length, at most every half percent.
+    let stage = Cell::new("");
+    let shown = Cell::new(-1.0f64);
+    let report = |seconds: f64| {
+        let Some(total) = media.duration.filter(|d| *d > 0.0) else { return };
+        let percent = ((seconds / total) * 100.0).clamp(0.0, 100.0);
+        if percent - shown.get() >= 0.5 {
+            shown.set(percent);
+            reporter.emit(&Event::StageProgress {
+                stage: stage.get(),
+                percent: (percent * 10.0).round() / 10.0,
+            });
         }
     };
-    if job.audio.is_some() {
-        let source_ext = files[0].extension().and_then(|e| e.to_str()).unwrap_or("");
-        if source_ext.eq_ignore_ascii_case(&ext) && streams[0].kind == StreamKind::Audio && streams[0].protocol != Protocol::Hls {
-            retag(false).await?;
-        } else {
-            reporter.emit(&Event::Stage { stage: "extracting audio" });
-            need_ffmpeg("extract the audio")?
-                .audio(&files[0], streams[0].codec.as_deref(), &merged, media, cover)
+    let progress: Option<&dyn Fn(f64)> = Some(&report);
+    let begin = |name: &'static str| {
+        stage.set(name);
+        shown.set(-1.0);
+        reporter.emit(&Event::Stage { stage: name });
+    };
+    let result: Result<()> = async {
+        // Files that need no other ffmpeg step still get their tags, cover and subtitles when asked to.
+        let retag = |video: bool| {
+            let ffmpeg = job
+                .ffmpeg
+                .as_ref()
+                .filter(|_| (job.embed_metadata || cover.is_some() || !subs.is_empty()) && taggable(&ext));
+            let (files, merged, final_path, subs) = (&files, &merged, &final_path, &subs);
+            async move {
+                match ffmpeg {
+                    Some(ffmpeg) => {
+                        begin("tagging");
+                        ffmpeg.tag(&files[0], merged, media, video, cover, subs, progress).await?;
+                        move_file(merged, final_path).await
+                    }
+                    None => move_file(&files[0], final_path).await,
+                }
+            }
+        };
+        if job.audio.is_some() {
+            let source_ext = files[0].extension().and_then(|e| e.to_str()).unwrap_or("");
+            if source_ext.eq_ignore_ascii_case(&ext) && streams[0].kind == StreamKind::Audio && streams[0].protocol != Protocol::Hls {
+                retag(false).await?;
+            } else {
+                begin("extracting audio");
+                need_ffmpeg("extract the audio")?
+                    .audio(&files[0], streams[0].codec.as_deref(), &merged, media, cover, progress)
+                    .await?;
+                move_file(&merged, &final_path).await?;
+            }
+        } else if files.len() > 1 {
+            begin("merging");
+            let hls = streams.iter().any(|s| s.protocol == Protocol::Hls);
+            need_ffmpeg("merge video and audio")?
+                .mux(&files, &merged, media, hls, cover, &subs, progress)
                 .await?;
             move_file(&merged, &final_path).await?;
+        } else if streams[0].protocol == Protocol::Hls && ext != "ts" {
+            begin("remuxing");
+            need_ffmpeg("remux the HLS stream")?
+                .mux(&files, &merged, media, true, cover, &subs, progress)
+                .await?;
+            move_file(&merged, &final_path).await?;
+        } else {
+            retag(streams[0].kind != StreamKind::Audio && !is_audio_ext(&ext)).await?;
         }
-    } else if files.len() > 1 {
-        reporter.emit(&Event::Stage { stage: "merging" });
-        let hls = streams.iter().any(|s| s.protocol == Protocol::Hls);
-        need_ffmpeg("merge video and audio")?
-            .mux(&files, &merged, media, hls, cover)
-            .await?;
-        move_file(&merged, &final_path).await?;
-    } else if streams[0].protocol == Protocol::Hls && ext != "ts" {
-        reporter.emit(&Event::Stage { stage: "remuxing" });
-        need_ffmpeg("remux the HLS stream")?
-            .mux(&files, &merged, media, true, cover)
-            .await?;
-        move_file(&merged, &final_path).await?;
-    } else {
-        retag(streams[0].kind != StreamKind::Audio && !is_audio_ext(&ext)).await?;
+        Ok(())
     }
-    let covers = [thumbnail.clone(), thumbnail.with_extension("jpg")];
-    for f in files.iter().chain([&merged]).chain(&covers) {
+    .await;
+    remove_all(extras()).await;
+    if let Err(e) = result {
+        // The finished streams stay, so the next run only does this step again.
+        tokio::fs::remove_file(&merged).await.ok();
+        return Err(e);
+    }
+    for f in files.iter().chain([&merged]) {
         if f != &final_path {
             tokio::fs::remove_file(f).await.ok();
         }
@@ -233,12 +310,7 @@ pub async fn run(client: Client, job: Job, reporter: &Reporter) -> Result<PathBu
         seconds: post_started.elapsed().as_secs_f64(),
     });
     let bytes = tokio::fs::metadata(&final_path).await.map(|m| m.len()).unwrap_or(0);
-    let path = final_path.to_string_lossy();
-    reporter.emit(&Event::Done {
-        path: &path,
-        bytes,
-        seconds: started.elapsed().as_secs_f64(),
-    });
+    done(bytes, started.elapsed().as_secs_f64());
     Ok(final_path)
 }
 
@@ -268,6 +340,12 @@ fn final_ext(job: &Job, streams: &[&Stream]) -> String {
         Protocol::Hls if job.ffmpeg.is_some() => job.merge_format.clone().unwrap_or_else(|| "mp4".into()),
         Protocol::Hls => "ts".into(),
         Protocol::Http | Protocol::Fragments => streams[0].ext.clone(),
+    }
+}
+
+async fn remove_all(paths: impl IntoIterator<Item = &PathBuf>) {
+    for f in paths {
+        tokio::fs::remove_file(f).await.ok();
     }
 }
 

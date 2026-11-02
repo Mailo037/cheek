@@ -1,22 +1,27 @@
 //! yt-dlp as the resolver: it knows the 1,800 sites and keeps up with them, cheek does the
 //! downloading. Reads the JSON that `yt-dlp -J` prints (from a file, stdin or by running it).
 
-use crate::media::{Media, Protocol, Stream, StreamKind};
-use anyhow::{Context, Result, bail};
+use crate::media::{Media, Protocol, Stream, StreamKind, Subtitle};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
-/// Runs `yt-dlp -J` for `url` with a yt-dlp format selector and reads its answer.
-pub async fn resolve(bin: &Path, url: &str, format: &str) -> Result<Media> {
-    let out = tokio::process::Command::new(bin)
+/// Runs `yt-dlp -J` for `url` with a yt-dlp format selector and reads its answer. A yt-dlp
+/// that hangs (a site that never answers, a stuck login) is stopped after `timeout`.
+pub async fn resolve(bin: &Path, url: &str, format: &str, timeout: Duration) -> Result<Media> {
+    let mut command = tokio::process::Command::new(bin);
+    command
         .args(["-J", "--no-playlist", "--no-warnings", "-f", format, url])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(timeout, command.output())
         .await
+        .map_err(|_| anyhow!("yt-dlp didn't answer within {} s", timeout.as_secs()))?
         .with_context(|| format!("running {}", bin.display()))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
@@ -64,7 +69,40 @@ pub fn from_info_json(v: &Value) -> Result<Media> {
         duration: v.get("duration").and_then(Value::as_f64),
         uploader: s(v, "uploader").or_else(|| s(v, "channel")),
         streams,
+        subtitles: subtitles(v),
     })
+}
+
+/// The subtitles yt-dlp picked (`requested_subtitles`, with `--write-subs`), else every
+/// language the site offers, each in the first format ffmpeg reads well. Automatic captions
+/// stay out, as they do in yt-dlp unless asked for.
+fn subtitles(v: &Value) -> Vec<Subtitle> {
+    const READABLE: [&str; 3] = ["vtt", "srt", "ass"];
+    let one = |lang: &str, f: &Value| -> Option<Subtitle> {
+        let ext = f.get("ext").and_then(Value::as_str)?;
+        let url = f.get("url").and_then(Value::as_str).filter(|u| u.starts_with("http"))?;
+        READABLE.contains(&ext).then(|| Subtitle {
+            lang: lang.to_string(),
+            ext: ext.to_string(),
+            url: url.to_string(),
+        })
+    };
+    if let Some(requested) = v.get("requested_subtitles").and_then(Value::as_object) {
+        return requested.iter().filter_map(|(lang, f)| one(lang, f)).collect();
+    }
+    let Some(all) = v.get("subtitles").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    all.iter()
+        .filter(|(lang, _)| lang.as_str() != "live_chat")
+        .filter_map(|(lang, formats)| {
+            let list = formats.as_array()?;
+            READABLE
+                .iter()
+                .find_map(|ext| list.iter().find(|f| f.get("ext").and_then(Value::as_str) == Some(ext)))
+                .and_then(|f| one(lang, f))
+        })
+        .collect()
 }
 
 fn stream(f: &Value) -> Result<Stream> {
@@ -211,6 +249,23 @@ mod tests {
         );
         let roundtrip: Media = serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
         assert_eq!(roundtrip.streams[0].fragments, s.fragments);
+    }
+
+    #[test]
+    fn subtitles_in_formats_ffmpeg_reads() {
+        let m = from_info_json(&json!({
+            "id": "x", "title": "t", "url": "https://v/x.mp4", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a",
+            "subtitles": {
+                "de": [{"ext": "json3", "url": "https://s/de.json3"}, {"ext": "vtt", "url": "https://s/de.vtt"}],
+                "en-US": [{"ext": "srt", "url": "https://s/en.srt"}],
+                "live_chat": [{"ext": "vtt", "url": "https://s/chat"}],
+                "fr": [{"ext": "srv3", "url": "https://s/fr.srv3"}]
+            }
+        }))
+        .unwrap();
+        let langs: Vec<_> = m.subtitles.iter().map(|s| (s.lang.as_str(), s.ext.as_str())).collect();
+        assert_eq!(langs, [("de", "vtt"), ("en-US", "srt")]);
+        assert!(m.subtitles[1].matches("en") && m.subtitles[1].matches("en.*") && !m.subtitles[1].matches("e"));
     }
 
     #[test]

@@ -2,3 +2,6 @@
 /dist
 *.part
 *.cheek
+
+# Release signing key (a repository secret, never committed)
+/signing

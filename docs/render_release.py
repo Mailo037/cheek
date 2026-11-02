@@ -2,7 +2,7 @@
 same look as docs/hero.png. Change VERSION, the headline, FEATURES and the terminal lines
 for each release; older pictures stay in docs/releases.
 
-    python docs/render_release.py --fonts ../Hamstr/app/src/main/res/font
+    python docs/render_release.py --fonts ../Hamstr/shared/src/commonMain/composeResources/font
 """
 import argparse
 import pathlib
@@ -12,17 +12,18 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 CANVAS, OVERLAY, LINE = (20, 20, 20), (30, 30, 30), (54, 54, 54)
 INK, MUTED, GHOST, ACCENT, GREEN = (238, 238, 238), (170, 170, 170), (138, 138, 138), (255, 154, 60), (16, 185, 129)
-VERSION = "0.2.2"
+VERSION = "0.3.2"
 FEATURES = [
-    ("GLYPH SHARES", "Resolve songs and playlists from their links"),
-    ("KEEP THE REST", "One failed song does not stop the playlist"),
+    ("ENCRYPTED HLS", "AES-128 and byte-range playlists"),
+    ("SUBTITLES", "Written into mp4, mkv and webm"),
+    ("SIGNED RELEASES", "Hamstr installs only what the key signed"),
 ]
-HEADLINE = ("Shared songs,", "kept in order.")
+HEADLINE = ("More streams,", "signed releases.")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--fonts", default="../Hamstr/app/src/main/res/font")
+    ap.add_argument("--fonts", default="../Hamstr/shared/src/commonMain/composeResources/font")
     a = ap.parse_args()
     fonts = pathlib.Path(a.fonts)
     f = lambda name, size: ImageFont.truetype(str(fonts / name), size)
@@ -70,15 +71,15 @@ def main():
     tf = f("jetbrains_mono_400.ttf", 27)
     tb = f("jetbrains_mono_600.ttf", 27)
     lines = [
-        [("$ ", GHOST), ("cheek ", ACCENT), ("https://glyph.my/p/SHARE_ID", INK)],
-        [("[Glyph] ", GHOST), ("resolve the shared playlist", MUTED)],
+        [("$ ", GHOST), ("cheek ", ACCENT), ("--embed-subs https://…/master.m3u8", INK)],
+        [("[hls] ", GHOST), ("AES-128, 412 segments, decrypted as they come", MUTED)],
         [],
-        [("[1/3] ", GHOST), ("first song downloaded", GREEN)],
-        [("[2/3] ", GHOST), ("source unavailable, continuing", MUTED)],
-        [("[3/3] ", GHOST), ("last song downloaded", GREEN)],
+        "BAR",
+        [("[merge] ", GHOST), ("ffmpeg 64 %", MUTED)],
+        [("[subs] ", GHOST), ("en, de written into the file", GREEN)],
         [],
-        [("[cheek] ", GHOST), ("2 saved, 1 failed", INK)],
-        [("        ", GHOST), ("previews stay clearly marked", MUTED)],
+        [("[cheek] ", GHOST), ("saved episode.mkv", INK)],
+        [("        ", GHOST), ("SHA256SUMS.txt.sig signs every release", MUTED)],
     ]
     y = py + 100
     for parts in lines:

@@ -166,6 +166,7 @@ fn single(final_url: &Url, original: &str, stream: Stream) -> Media {
         thumbnail: None,
         duration: None,
         uploader: None,
+        subtitles: Vec::new(),
         streams: vec![stream],
     }
 }
@@ -185,7 +186,7 @@ fn percent_decode(s: &str) -> String {
             i += 3;
             continue;
         }
-        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        out.push(bytes[i]);
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -316,6 +317,7 @@ mod tests {
     #[test]
     fn names_from_urls() {
         assert_eq!(percent_decode("Big%20Buck%20Bunny.mp4"), "Big Buck Bunny.mp4");
+        assert_eq!(percent_decode("C++%20talk.mp4"), "C++ talk.mp4");
         assert_eq!(short_hash("x").len(), 11);
     }
 }

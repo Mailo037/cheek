@@ -77,12 +77,16 @@ cheek https://example.com/talk.mp4 -N 8 --chunk-size 1M
 | `--merge-output-format` | picked like yt-dlp | `mp4`, `mkv` or `webm` when video and audio are joined |
 | `--embed-thumbnail` | | Write the thumbnail into the file as its cover (mp4, m4a, mkv, mp3, opus, ogg, flac) |
 | `--embed-metadata` | | Write title, artist and link into every file, even one that needed no ffmpeg step |
+| `--embed-subs`, `--sub-langs` | `en` | Write the site's subtitles into the file (mp4, mkv, webm), in these languages (`en,de`, yt-dlp's `en.*`, or `all`) |
+| `--resolve-timeout` | `180` | Seconds yt-dlp may take to resolve a link |
 | `--json` | | One JSON event per line on stdout, for apps |
 | `-J, --dump-json` | | Print what would be downloaded and stop |
 
 Parallel downloading is automatic: direct files use byte ranges when the server supports them; HLS and yt-dlp's `http_dash_segments` formats use the supplied fragments. The source determines their duration (for example, 2–6 seconds); `--chunk-size` controls byte ranges, not fragment duration. Initialization fragments are included and all fragments are joined in order without re-encoding. `-N` limits requests across video and audio together; `-N 1` downloads sequentially. More connections help when individual requests are throttled, but cannot exceed your connection or the server's bandwidth.
 
-Static, unencrypted DASH fragment lists support absolute URLs and paths relative to `fragment_base_url`. Live DASH, encrypted fragments and DASH byte-range fragments are rejected. HLS encryption and byte-range playlists remain unsupported.
+Static, unencrypted DASH fragment lists support absolute URLs and paths relative to `fragment_base_url`. Live DASH, encrypted fragments and DASH byte-range fragments are rejected. HLS segments encrypted with AES-128 are decrypted as they arrive, and byte-range playlists fetch their pieces of one file; SAMPLE-AES and DRM schemes are not supported. A live HLS stream (one whose playlist keeps growing) is left to yt-dlp.
+
+`--info-json` also takes a flat playlist from `yt-dlp -J --flat-playlist`: cheek resolves and downloads its videos one after another with yt-dlp (`--yt-dlp`), and each `done` event names the video and the playlist.
 
 Press Ctrl+C and the `.part` file stays. Ranged HTTP downloads keep a small `.cheek` note of completed chunks, and HLS and DASH fragment downloads one of the fragments already written; both resume on the next run, even when a fresh resolve hands out new tokens for the same fragments.
 
@@ -128,7 +132,7 @@ With `--json`, every line on stdout is one event:
 {"type":"done","path":"Caminandes 3： Llamigos [SkVqJ1SGeL0].mp4","bytes":26214400,"seconds":1.2}
 ```
 
-`stage` is one of `merging`, `extracting audio`, `remuxing`, `tagging` (only tags and cover, no other ffmpeg step) or `already downloaded`; it arrives once the bytes are in and ffmpeg takes over. When something fails, the last line is `{"type":"error","message":"..."}` and the exit code is 1. An interruption exits with 130.
+`stage` is one of `merging`, `extracting audio`, `remuxing`, `tagging` (only tags, cover and subtitles, no other ffmpeg step) or `already downloaded`; it arrives once the bytes are in and ffmpeg takes over. While ffmpeg works, `{"type":"stage_progress","stage":"merging","percent":42.0}` follows when the length is known. `done` also carries `title`, `thumbnail`, `duration` and, in a playlist, `playlist_title`. When something fails, the last line is `{"type":"error","message":"..."}` and the exit code is 1. An interruption exits with 130.
 
 ## Install
 
@@ -148,6 +152,8 @@ cargo install --git https://github.com/Mailo037/cheek
 ```
 
 ffmpeg is only needed for merging, audio extraction and HLS remuxing; a single-file download works without it. yt-dlp is only needed for the sites cheek doesn't resolve by itself.
+
+Each release's `SHA256SUMS.txt` is signed (`SHA256SUMS.txt.sig`, ECDSA P-256 over SHA-256, DER). Check it with `openssl dgst -sha256 -verify cheek.pub -signature SHA256SUMS.txt.sig SHA256SUMS.txt`, where `cheek.pub` is the PEM form of the key in Hamstr's `ReleaseKeys.CHEEK`.
 
 ## How it works
 

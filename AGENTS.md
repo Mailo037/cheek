@@ -5,10 +5,11 @@ Notes for anyone (human or agent) changing the code. The README is for people wh
 ## Layout
 
 - `src/download.rs`: ranged downloads. Chunk sizes adapt so that every connection stays busy to the end. Failed ranges retry with backoff, without counting their bytes twice.
-- `src/hls.rs`: master and media playlists, init segments, parallel segments written in order, resume notes for fragments.
+- `src/hls.rs`: master and media playlists, init segments, AES-128 segments (decrypted on the way) and byte-range playlists, parallel segments written in order, resume notes for fragments. A playlist without an end tag is looked at once more: if it grew, it's live, which cheek leaves to yt-dlp.
 - `src/extract/`: the generic extractor, the yt-dlp JSON reader and the CineSrc resolver.
 - `src/select.rs`: yt-dlp's `-f` format selection on an info dict that is already resolved.
-- `src/merge.rs`: ffmpeg calls that copy streams, embed covers and tags; they only re-encode when you ask for a different audio format.
+- `src/merge.rs`: ffmpeg calls that copy streams, embed covers, tags and subtitles; they only re-encode when you ask for a different audio format (and subtitles into the format a container keeps). They report how far they are (`stage_progress`).
+- `src/run.rs`: one download: streams in parallel, then ffmpeg. A finished stream keeps its file until the result is in, so a run after a failed merge only merges again.
 
 ## Build and check
 
@@ -38,6 +39,6 @@ git tag v0.2.1
 git push origin v0.2.1
 ```
 
-Every release gets a what's-new picture on top of its notes. Before tagging, update `VERSION`, the headline, `FEATURES` and the terminal lines in [`docs/render_release.py`](docs/render_release.py), run `python docs/render_release.py --fonts ../Hamstr/app/src/main/res/font`, look at the result and commit `docs/releases/v<version>.png`. The notes link it by the tag (`raw.githubusercontent.com/Mailo037/cheek/v<version>/docs/releases/v<version>.png`), so the picture has to be in the tagged commit. A bugfix release gets one too.
+Every release gets a what's-new picture on top of its notes. Before tagging, update `VERSION`, the headline, `FEATURES` and the terminal lines in [`docs/render_release.py`](docs/render_release.py), run `python docs/render_release.py --fonts ../Hamstr/shared/src/commonMain/composeResources/font`, look at the result and commit `docs/releases/v<version>.png`. The notes link it by the tag (`raw.githubusercontent.com/Mailo037/cheek/v<version>/docs/releases/v<version>.png`), so the picture has to be in the tagged commit. A bugfix release gets one too.
 
-[`release.yml`](.github/workflows/release.yml) builds every binary and publishes them with `SHA256SUMS.txt`. If `.github/release-notes/<tag>.md` exists, it becomes the release text. Hamstr picks up releases with the same command line by itself (same major version, for 0.x the same minor).
+[`release.yml`](.github/workflows/release.yml) builds every binary and publishes them with `SHA256SUMS.txt` and its signature, `SHA256SUMS.txt.sig`, made with the `CHEEK_SIGNING_KEY` secret (the PEM of `signing/cheek-release-key.pem`, which git ignores). Hamstr only installs Cheek updates whose checksums that key signed; its public key is `ReleaseKeys.CHEEK` in Hamstr. If `.github/release-notes/<tag>.md` exists, it becomes the release text. Hamstr picks up releases with the same command line by itself (same major version, for 0.x the same minor).

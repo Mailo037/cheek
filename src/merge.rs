@@ -1,6 +1,7 @@
 //! ffmpeg for the last step: joining video and audio, pulling out the sound, remuxing HLS,
-//! and writing the tags and the cover into the file. Streams are copied whenever the
-//! container allows it; re-encoding only happens for an audio format the source doesn't have.
+//! and writing the tags, the cover and subtitles into the file. Streams are copied whenever
+//! the container allows it; re-encoding only happens for an audio format the source doesn't
+//! have, and for subtitles the container needs in its own format.
 
 use crate::extract::which;
 use crate::media::Media;
@@ -8,6 +9,26 @@ use anyhow::{Context, Result, bail};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+
+/// A subtitle file to write into the result, and its language.
+pub struct SubFile {
+    pub path: PathBuf,
+    pub lang: String,
+}
+
+/// Called with how many seconds of the media ffmpeg has written so far.
+pub type Progress<'a> = Option<&'a dyn Fn(f64)>;
+
+/// The subtitle format a container keeps, or `None` when it keeps none ffmpeg can write.
+pub fn subtitle_codec(ext: &str) -> Option<&'static str> {
+    match ext.to_ascii_lowercase().as_str() {
+        "mp4" | "m4v" | "mov" => Some("mov_text"),
+        "mkv" => Some("srt"),
+        "webm" => Some("webvtt"),
+        _ => None,
+    }
+}
 
 #[derive(Clone)]
 pub struct Ffmpeg {
@@ -25,18 +46,40 @@ impl Ffmpeg {
         explicit.cloned().or_else(|| which("ffmpeg")).map(|bin| Ffmpeg { bin })
     }
 
-    async fn run(&self, args: &[OsString]) -> Result<()> {
-        let out = tokio::process::Command::new(&self.bin)
-            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
+    async fn run(&self, args: &[OsString], progress: Progress<'_>) -> Result<()> {
+        let mut command = tokio::process::Command::new(&self.bin);
+        command.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]);
+        // ffmpeg's own report, key=value lines on stdout, instead of its status line.
+        if progress.is_some() {
+            command.args(["-progress", "pipe:1", "-nostats"]);
+        }
+        let mut child = command
             .args(args)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(if progress.is_some() { Stdio::piped() } else { Stdio::null() })
             .stderr(Stdio::piped())
-            .output()
-            .await
+            .kill_on_drop(true)
+            .spawn()
             .with_context(|| format!("running {}", self.bin.display()))?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
+        let mut stderr = child.stderr.take().context("ffmpeg has no error output")?;
+        let errors = tokio::spawn(async move {
+            let mut text = String::new();
+            stderr.read_to_string(&mut text).await.ok();
+            text
+        });
+        if let (Some(report), Some(out)) = (progress, child.stdout.take()) {
+            let mut lines = tokio::io::BufReader::new(out).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(us) = line.strip_prefix("out_time_us=").and_then(|v| v.trim().parse::<i64>().ok())
+                    && us >= 0
+                {
+                    report(us as f64 / 1_000_000.0);
+                }
+            }
+        }
+        let status = child.wait().await?;
+        let err = errors.await.unwrap_or_default();
+        if !status.success() {
             bail!(
                 "ffmpeg failed: {}",
                 err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no output")
@@ -45,16 +88,46 @@ impl Ffmpeg {
         Ok(())
     }
 
+    /// Inputs, maps and codec options for `subs`, the first of them input number `first`.
+    fn subtitle_args(subs: &[SubFile], first: usize, ext: &str) -> (Vec<OsString>, Vec<OsString>) {
+        let Some(codec) = subtitle_codec(ext).filter(|_| !subs.is_empty()) else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut inputs: Vec<OsString> = Vec::new();
+        let mut outputs: Vec<OsString> = Vec::new();
+        for (k, sub) in subs.iter().enumerate() {
+            inputs.extend(["-i".into(), sub.path.clone().into()]);
+            outputs.extend(["-map".into(), format!("{}:0", first + k).into()]);
+            // Containers want ISO 639 codes; "en-US" becomes "en", which ffmpeg turns into "eng".
+            let lang = sub.lang.split(['-', '_']).next().unwrap_or("und");
+            outputs.extend([format!("-metadata:s:s:{k}").into(), format!("language={lang}").into()]);
+        }
+        outputs.extend(["-c:s".into(), codec.into()]);
+        (inputs, outputs)
+    }
+
     /// Copies the streams of all inputs into `out`, video from the first, audio from the last.
     /// `from_hls` marks MPEG-TS input, whose AAC needs repacking for MP4.
-    pub async fn mux(&self, inputs: &[PathBuf], out: &Path, media: &Media, from_hls: bool, cover: Option<&Cover>) -> Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mux(
+        &self,
+        inputs: &[PathBuf],
+        out: &Path,
+        media: &Media,
+        from_hls: bool,
+        cover: Option<&Cover>,
+        subs: &[SubFile],
+        progress: Progress<'_>,
+    ) -> Result<()> {
         let ext = ext_of(out);
         let art = Art::new(cover, &ext, inputs.len(), out).await?;
+        let (sub_inputs, sub_outputs) = Self::subtitle_args(subs, inputs.len() + art.input_count(), &ext);
         let mut args: Vec<OsString> = Vec::new();
         for i in inputs {
             args.extend(["-i".into(), i.into()]);
         }
         args.extend(art.inputs());
+        args.extend(sub_inputs);
         if inputs.len() > 1 {
             args.extend([
                 "-map".into(),
@@ -62,12 +135,13 @@ impl Ffmpeg {
                 "-map".into(),
                 format!("{}:a:0", inputs.len() - 1).into(),
             ]);
-        } else if art.is_some() {
+        } else if art.is_some() || !sub_outputs.is_empty() {
             // Spelled out, or ffmpeg's own pick could take the cover for the video.
             args.extend(["-map".into(), "0:v:0?".into(), "-map".into(), "0:a:0?".into()]);
         }
         args.extend(["-c".into(), "copy".into()]);
         args.extend(art.outputs(usize::from(inputs.len() > 1 || media.has_video())));
+        args.extend(sub_outputs);
         if ext == "mp4" || ext == "m4a" || ext == "mov" {
             // HLS transport streams carry AAC in ADTS frames, which MP4 can't hold as they are.
             // Only then: the filter refuses other codecs, like the Opus YouTube often serves.
@@ -78,13 +152,21 @@ impl Ffmpeg {
         }
         args.extend(metadata(media));
         args.push(out.into());
-        let result = self.run(&args).await;
+        let result = self.run(&args, progress).await;
         art.clean().await;
         result
     }
 
     /// Writes the audio of `input` as `out`, copying when the codec already fits.
-    pub async fn audio(&self, input: &Path, codec: Option<&str>, out: &Path, media: &Media, cover: Option<&Cover>) -> Result<()> {
+    pub async fn audio(
+        &self,
+        input: &Path,
+        codec: Option<&str>,
+        out: &Path,
+        media: &Media,
+        cover: Option<&Cover>,
+        progress: Progress<'_>,
+    ) -> Result<()> {
         let ext = ext_of(out);
         let codec = codec.unwrap_or("").to_ascii_lowercase();
         let encode: &[&str] = match ext.as_str() {
@@ -110,18 +192,30 @@ impl Ffmpeg {
         args.extend(art.outputs(0));
         args.extend(metadata(media));
         args.push(out.into());
-        let result = self.run(&args).await;
+        let result = self.run(&args, progress).await;
         art.clean().await;
         result
     }
 
-    /// Copies `input` as it is into `out`, adding the tags and the cover: for files that
-    /// needed no other ffmpeg step. `video` says whether `input` has a picture stream.
-    pub async fn tag(&self, input: &Path, out: &Path, media: &Media, video: bool, cover: Option<&Cover>) -> Result<()> {
+    /// Copies `input` as it is into `out`, adding the tags, the cover and subtitles: for files
+    /// that needed no other ffmpeg step. `video` says whether `input` has a picture stream.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn tag(
+        &self,
+        input: &Path,
+        out: &Path,
+        media: &Media,
+        video: bool,
+        cover: Option<&Cover>,
+        subs: &[SubFile],
+        progress: Progress<'_>,
+    ) -> Result<()> {
         let ext = ext_of(out);
         let art = Art::new(cover, &ext, 1, out).await?;
+        let (sub_inputs, sub_outputs) = Self::subtitle_args(subs, 1 + art.input_count(), &ext);
         let mut args: Vec<OsString> = vec!["-i".into(), input.into()];
         args.extend(art.inputs());
+        args.extend(sub_inputs);
         args.extend([
             "-map".into(),
             "0".into(),
@@ -131,12 +225,13 @@ impl Ffmpeg {
             "copy".into(),
         ]);
         args.extend(art.outputs(usize::from(video)));
+        args.extend(sub_outputs);
         if ext == "mp4" || ext == "m4a" || ext == "mov" {
             args.extend(["-movflags".into(), "+faststart".into()]);
         }
         args.extend(metadata(media));
         args.push(out.into());
-        let result = self.run(&args).await;
+        let result = self.run(&args, progress).await;
         art.clean().await;
         result
     }
@@ -182,15 +277,18 @@ impl Ffmpeg {
             });
         }
         let jpg = src.with_extension("jpg");
-        self.run(&[
-            "-i".into(),
-            src.into(),
-            "-frames:v".into(),
-            "1".into(),
-            "-q:v".into(),
-            "2".into(),
-            jpg.clone().into(),
-        ])
+        self.run(
+            &[
+                "-i".into(),
+                src.into(),
+                "-frames:v".into(),
+                "1".into(),
+                "-q:v".into(),
+                "2".into(),
+                jpg.clone().into(),
+            ],
+            None,
+        )
         .await?;
         Ok(Cover {
             path: jpg,
@@ -241,6 +339,11 @@ impl<'a> Art<'a> {
 
     fn is_some(&self) -> bool {
         !matches!(self, Art::None)
+    }
+
+    /// How many ffmpeg inputs the cover adds.
+    fn input_count(&self) -> usize {
+        usize::from(matches!(self, Art::Stream { .. } | Art::Comment { .. }))
     }
 
     fn inputs(&self) -> Vec<OsString> {
@@ -433,25 +536,31 @@ mod cover_pipeline_tests {
         let audio = dir.path().join("audio.wav");
         let image = dir.path().join("cover.webp");
         ffmpeg
-            .run(&[
-                "-f".into(),
-                "lavfi".into(),
-                "-i".into(),
-                "sine=frequency=440:duration=0.2".into(),
-                audio.clone().into(),
-            ])
+            .run(
+                &[
+                    "-f".into(),
+                    "lavfi".into(),
+                    "-i".into(),
+                    "sine=frequency=440:duration=0.2".into(),
+                    audio.clone().into(),
+                ],
+                None,
+            )
             .await
             .unwrap();
         ffmpeg
-            .run(&[
-                "-f".into(),
-                "lavfi".into(),
-                "-i".into(),
-                "color=red:size=32x32".into(),
-                "-frames:v".into(),
-                "1".into(),
-                image.clone().into(),
-            ])
+            .run(
+                &[
+                    "-f".into(),
+                    "lavfi".into(),
+                    "-i".into(),
+                    "color=red:size=32x32".into(),
+                    "-frames:v".into(),
+                    "1".into(),
+                    image.clone().into(),
+                ],
+                None,
+            )
             .await
             .unwrap();
         let cover = ffmpeg.cover_for(&image, "mp3").await.unwrap();
@@ -466,12 +575,64 @@ mod cover_pipeline_tests {
             duration: None,
             uploader: None,
             streams: Vec::new(),
+            subtitles: Vec::new(),
         };
         let output = dir.path().join("song.mp3");
         ffmpeg
-            .audio(&audio, Some("pcm_s16le"), &output, &media, Some(&cover))
+            .audio(&audio, Some("pcm_s16le"), &output, &media, Some(&cover), None)
             .await
             .unwrap();
         assert!(output.metadata().unwrap().len() > 0);
+    }
+
+    #[tokio::test]
+    async fn subtitles_go_into_mp4_and_progress_is_reported() {
+        let Some(bin) = std::env::var_os("CHEEK_TEST_FFMPEG").map(PathBuf::from).or_else(|| which("ffmpeg")) else {
+            return;
+        };
+        let ffmpeg = Ffmpeg { bin };
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("video.mp4");
+        ffmpeg
+            .run(
+                &[
+                    "-f".into(),
+                    "lavfi".into(),
+                    "-i".into(),
+                    "testsrc=size=64x64:duration=2".into(),
+                    "-f".into(),
+                    "lavfi".into(),
+                    "-i".into(),
+                    "sine=duration=2".into(),
+                    "-shortest".into(),
+                    video.clone().into(),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+        let vtt = dir.path().join("sub.vtt");
+        std::fs::write(&vtt, "WEBVTT\n\n00:00.000 --> 00:01.500\nHallo\n").unwrap();
+        let media = Media {
+            id: "t".into(),
+            title: "t".into(),
+            extractor: "t".into(),
+            webpage_url: String::new(),
+            thumbnail: None,
+            duration: Some(2.0),
+            uploader: None,
+            streams: Vec::new(),
+            subtitles: Vec::new(),
+        };
+        let out = dir.path().join("out.mp4");
+        let seen = std::cell::Cell::new(0.0f64);
+        let report = |s: f64| seen.set(s);
+        let subs = [SubFile {
+            path: vtt,
+            lang: "de-DE".into(),
+        }];
+        ffmpeg.tag(&video, &out, &media, true, None, &subs, Some(&report)).await.unwrap();
+        assert!(out.metadata().unwrap().len() > 0);
+        assert!(seen.get() > 0.0, "ffmpeg reported no progress");
     }
 }

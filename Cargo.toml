@@ -1,6 +1,6 @@
 [package]
 name = "cheek"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "Fast media downloads in Rust: parallel ranged HTTP, HLS, ffmpeg merge, yt-dlp compatible"
 license = "Unlicense"
@@ -10,6 +10,9 @@ keywords = ["yt-dlp", "downloader", "video", "hls", "android"]
 categories = ["command-line-utilities", "multimedia::video"]
 
 [dependencies]
+# AES-128 HLS segments (a key the playlist gives every player).
+aes = "0.8"
+cbc = { version = "0.1", features = ["std"] }
 httpdate = "1.0"
 anyhow = "1.0.104"
 bytes = "1.12.1"

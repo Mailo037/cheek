@@ -332,6 +332,7 @@ async fn resolve(client: &Client, target: &Target) -> Result<Media> {
         thumbnail: None,
         duration: None,
         uploader: None,
+        subtitles: Vec::new(),
         streams: vec![Stream {
             url: stream_url,
             ext: "mp4".into(),

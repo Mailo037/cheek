@@ -77,6 +77,7 @@ mod tests {
             duration: None,
             uploader: None,
             streams: vec![],
+            subtitles: Vec::new(),
         }
     }
 

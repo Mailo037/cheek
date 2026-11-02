@@ -55,7 +55,10 @@ pub fn negotiated_download_client(user_agent: Option<&str>, connections: usize) 
         .build()
 }
 
-/// Respect server cooldowns (seconds or HTTP date), with jitter to spread retries.
+/// The longest a server's Retry-After is waited for; a longer one is retried after this anyway.
+pub const MAX_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Respect server cooldowns (seconds or HTTP date, up to [`MAX_COOLDOWN`]), with jitter to spread retries.
 pub fn retry_delay(headers: Option<&header::HeaderMap>, attempt: u32) -> Duration {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -75,6 +78,7 @@ pub fn retry_delay(headers: Option<&header::HeaderMap>, attempt: u32) -> Duratio
             .unwrap_or_default()
             .subsec_nanos() as u64;
     server
+        .map(|d| d.min(MAX_COOLDOWN))
         .unwrap_or_else(|| Duration::from_millis(300 * 2u64.pow(attempt.min(6))))
         .saturating_add(Duration::from_millis(salt % 300))
 }
@@ -93,5 +97,7 @@ mod tests {
         h.insert(header::RETRY_AFTER, "invalid".parse().unwrap());
         let d = retry_delay(Some(&h), 2);
         assert!((Duration::from_millis(1200)..Duration::from_millis(1500)).contains(&d));
+        h.insert(header::RETRY_AFTER, "3600".parse().unwrap());
+        assert!(retry_delay(Some(&h), 1) < MAX_COOLDOWN + Duration::from_secs(1));
     }
 }

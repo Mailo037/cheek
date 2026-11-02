@@ -70,11 +70,18 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # Hamstr installs a Cheek update only when this signature over the checksums holds
+      # (ReleaseKeys.CHEEK there). The secret holds the PEM of signing/cheek-release-key.pem.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          SIGNING_KEY: ${{ secrets.CHEEK_SIGNING_KEY }}
         run: |
-          cd dist && sha256sum * > SHA256SUMS.txt && cd ..
+          test -n "$SIGNING_KEY" || { echo "CHEEK_SIGNING_KEY is not set"; exit 1; }
+          cd dist && sha256sum * > SHA256SUMS.txt
+          printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
+          openssl dgst -sha256 -sign "$RUNNER_TEMP/key.pem" -out SHA256SUMS.txt.sig SHA256SUMS.txt
+          rm "$RUNNER_TEMP/key.pem" && cd ..
           NOTES=".github/release-notes/$GITHUB_REF_NAME.md"
           if [ -f "$NOTES" ]; then set -- --notes-file "$NOTES"; else set -- --generate-notes; fi
           gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --verify-tag "$@"

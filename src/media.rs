@@ -62,6 +62,26 @@ pub struct Media {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uploader: Option<String>,
     pub streams: Vec<Stream>,
+    /// Subtitles the site offers, one format per language; `--embed-subs` writes the asked-for ones in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subtitles: Vec<Subtitle>,
+}
+
+/// One language's subtitles, in a format ffmpeg reads (WebVTT, SubRip or ASS).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Subtitle {
+    pub lang: String,
+    pub ext: String,
+    pub url: String,
+}
+
+impl Subtitle {
+    /// Whether `wanted` (`en`, or yt-dlp's `en.*`) asks for this language: `en` takes `en-US` too.
+    pub fn matches(&self, wanted: &str) -> bool {
+        let w = wanted.trim().trim_end_matches(".*").trim_end_matches('*').to_ascii_lowercase();
+        let l = self.lang.to_ascii_lowercase();
+        w == "all" || l == w || l.starts_with(&format!("{w}-")) || l.starts_with(&format!("{w}_"))
+    }
 }
 
 impl Media {

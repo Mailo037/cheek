@@ -71,6 +71,56 @@ pub struct PlaylistEntry {
     pub extractor_key: String,
 }
 
+impl Playlist {
+    /// Cheek's own playlist JSON (`-J`) or yt-dlp's flat one (`yt-dlp -J --flat-playlist`),
+    /// whose entries may lack a title, a picture or even a link; those without a link are left out.
+    pub fn from_info(v: &Value) -> Result<Playlist> {
+        let s = |o: &Value, keys: &[&str]| {
+            keys.iter()
+                .find_map(|k| o.get(*k).and_then(Value::as_str).filter(|t| !t.is_empty()))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let picture = |o: &Value| {
+            let direct = s(o, &["thumbnail"]);
+            if !direct.is_empty() {
+                return direct;
+            }
+            o.get("thumbnails")
+                .and_then(Value::as_array)
+                .and_then(|all| all.iter().rev().find_map(|t| t.get("url").and_then(Value::as_str)))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let entries = v
+            .get("entries")
+            .and_then(Value::as_array)
+            .context("the playlist has no entries")?
+            .iter()
+            .filter_map(|e| {
+                let url = s(e, &["webpage_url", "url"]);
+                url.starts_with("http").then(|| PlaylistEntry {
+                    id: s(e, &["id"]),
+                    title: s(e, &["title"]),
+                    uploader: s(e, &["uploader", "channel", "artist"]),
+                    thumbnail: picture(e),
+                    extractor_key: s(e, &["extractor_key", "ie_key"]),
+                    url,
+                })
+            })
+            .collect();
+        Ok(Playlist {
+            kind: "playlist".into(),
+            id: s(v, &["id"]),
+            title: s(v, &["title"]),
+            extractor: s(v, &["extractor_key", "extractor"]),
+            webpage_url: s(v, &["webpage_url", "original_url"]),
+            thumbnail: picture(v),
+            entries,
+        })
+    }
+}
+
 static JSON_LD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?is)<script\s+type="application/ld\+json"\s*>(.*?)</script>"#).unwrap());
 
 fn playlist(html: &str, page: &str, id: &str) -> Result<Option<Playlist>> {

@@ -30,10 +30,6 @@ impl Progress {
     pub fn add(&self, n: u64) {
         self.done.fetch_add(n, Ordering::Relaxed);
     }
-    /// Takes back bytes from a request that failed half way and will be fetched again.
-    pub fn rewind(&self, n: u64) {
-        self.done.fetch_sub(n, Ordering::Relaxed);
-    }
     pub fn snapshot(&self) -> (u64, u64) {
         (self.done.load(Ordering::Relaxed), self.total.load(Ordering::Relaxed))
     }
@@ -63,10 +59,24 @@ pub enum Event<'a> {
     Stage {
         stage: &'a str,
     },
+    /// How far ffmpeg got with a stage, when the media's length is known.
+    StageProgress {
+        stage: &'a str,
+        percent: f64,
+    },
     Done {
         path: &'a str,
         bytes: u64,
         seconds: f64,
+        /// What the file is, so an app can list each song of a playlist under its own name.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thumbnail: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        playlist_title: Option<&'a str>,
     },
     Error {
         message: &'a str,
@@ -132,7 +142,7 @@ impl Reporter {
                     bar.set_position(*downloaded);
                 }
             }
-            Event::Timing { .. } => {}
+            Event::Timing { .. } | Event::StageProgress { .. } => {}
             Event::Stage { stage } => {
                 if let Some(bar) = &self.bar {
                     bar.suspend(|| eprintln!("[cheek] {stage}"));
@@ -140,7 +150,7 @@ impl Reporter {
                     eprintln!("[cheek] {stage}");
                 }
             }
-            Event::Done { path, bytes, seconds } => {
+            Event::Done { path, bytes, seconds, .. } => {
                 if let Some(bar) = &self.bar {
                     bar.finish_and_clear();
                 }
